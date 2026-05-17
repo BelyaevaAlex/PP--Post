@@ -1,0 +1,26 @@
+# --- core PPtheta-Post stack ---
+joblib==1.4.2
+numpy==1.26.4
+pandas==2.2.3
+torch==2.6.0
+scikit-learn==1.5.1
+xgboost>=2.0.3
+tqdm==4.66.5
+matplotlib==3.9.2
+seaborn==0.13.2
+PyYAML==6.0.1
+scipy==1.13.1
+openml
+beexai==0.0.6
+
+# --- tabular rule sources and standalone baselines (README §10.8) ---
+# CatBoost: oblivious-tree rule source + TabPFN-distill student option
+catboost>=1.2
+# imodels: FIGS / RuleFit (both as rule source and standalone baseline)
+imodels>=2.0
+# Explainable Boosting Machine: standalone glass-box baseline
+interpret>=0.5
+# TabPFN: standalone baseline + tabpfn_distill_{xgb,et,cb} rule sources
+#         + pl_ens_tabpfn / pl_ens_distill ensemble variants.
+# Pin to v2.x — v8 requires a PriorLabs license token at runtime.
+tabpfn>=2,<3

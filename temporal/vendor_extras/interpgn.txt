@@ -1,0 +1,11 @@
+# InterpGN (YunshiWen/InterpretGatedNetwork)
+# Adapter: VendoredInterpGNBaseline (PyTorch).
+#
+# Upstream eagerly imports the full ``dnn_dict`` (FCN, PatchTST,
+# TimesNet, Transformer, ResNet) inside ``models/InterpGN.py``, so
+# every transitive dependency of every backbone must be installable
+# even when ``default_interpgn_configs(dnn_type='FCN')`` is used.
+torch
+numpy
+einops
+reformer_pytorch

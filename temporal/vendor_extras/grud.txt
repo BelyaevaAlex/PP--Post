@@ -1,0 +1,6 @@
+# GRU-D (zhiyongc/GRU-D)
+# Adapter: VendoredGRUDBaseline (PyTorch).
+# Upstream is a single-file PyTorch model with the constraint
+# `hidden_size == n_vars`; no exotic deps.
+torch
+numpy

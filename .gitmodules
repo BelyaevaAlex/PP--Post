@@ -1,0 +1,28 @@
+[submodule "temporal/vendor/sand"]
+	path = temporal/vendor/sand
+	url = https://github.com/khirotaka/SAnD.git
+	ignore = untracked
+[submodule "temporal/vendor/mtan"]
+	path = temporal/vendor/mtan
+	url = https://github.com/reml-lab/mTAN.git
+	ignore = untracked
+[submodule "temporal/vendor/raindrop"]
+	path = temporal/vendor/raindrop
+	url = https://github.com/mims-harvard/Raindrop.git
+	ignore = untracked
+[submodule "temporal/vendor/grud"]
+	path = temporal/vendor/grud
+	url = https://github.com/zhiyongc/GRU-D.git
+	ignore = untracked
+[submodule "temporal/vendor/interpgn"]
+	path = temporal/vendor/interpgn
+	url = https://github.com/YunshiWen/InterpretGatedNetwork.git
+	ignore = untracked
+[submodule "temporal/vendor/seft"]
+	path = temporal/vendor/seft
+	url = https://github.com/BorgwardtLab/Set_Functions_for_Time_Series.git
+	ignore = untracked
+[submodule "temporal/vendor/camelot"]
+	path = temporal/vendor/camelot
+	url = https://github.com/hrna-ox/camelot-icml.git
+	ignore = untracked

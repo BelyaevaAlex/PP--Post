@@ -1,0 +1,9 @@
+# SAnD (khirotaka/SAnD)
+# Adapter: VendoredSAnDBaseline (PyTorch).
+# Upstream is a clean PyTorch Module — no extra deps beyond what
+# PPθ-Post already requires (torch, numpy).
+#
+# Listed explicitly so per-baseline venv bootstrap is uniform
+# across all vendored baselines.
+torch
+numpy

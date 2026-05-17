@@ -1,0 +1,24 @@
+# SeFT (BorgwardtLab/Set_Functions_for_Time_Series)
+# Adapter: VendoredSeFTBaseline (TensorFlow / Keras).
+#
+# IMPORTANT: upstream pins TensorFlow 1.15.x + Python 3.7 (see
+# vendor/seft/pyproject.toml).  The vendored entry point we wrap
+# (``seft.models.deep_set_attention.DeepSetAttentionModel``) actually
+# imports successfully on TF 2.x with ``tensorflow.compat.v1`` shims,
+# but a few internal helpers reach for ``tensorflow.nn.rnn_cell``
+# which was removed in TF 2.x.
+#
+# Recommended setup:
+#   1. Provision the dedicated venv with ``setup_envs.py seft``.
+#   2. The bootstrap installs TF 2.x + ``tensorflow_addons`` (compat
+#      backports for ``rnn_cell``) — the adapter then runs without
+#      patching upstream sources.
+#
+# If the bootstrap fails (e.g. on Apple Silicon without TF metal),
+# compare_temporal.py logs ``[skipped] seft`` and continues.
+tensorflow>=2.10,<2.16
+tensorflow_addons
+keras-transformer
+scikit-learn
+tqdm
+numpy

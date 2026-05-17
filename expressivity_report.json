@@ -1,0 +1,348 @@
+{
+  "E1_tau_consistency": [
+    {
+      "dataset": "Iris",
+      "n_branches": 74,
+      "n_test": 45,
+      "rows": [
+        {
+          "tau": 1.0,
+          "z_max_abs": 0.9994540492025333,
+          "z_rmse": 0.366798721930602,
+          "class_kl_sym_mean": 0.002810603890911883,
+          "class_max_abs": 0.052199840693212596,
+          "argmax_agreement": 0.8
+        },
+        {
+          "tau": 0.3,
+          "z_max_abs": 0.9494877859209694,
+          "z_rmse": 0.20823687207352792,
+          "class_kl_sym_mean": 0.0004084368098824527,
+          "class_max_abs": 0.024943017407975887,
+          "argmax_agreement": 0.9333333333333333
+        },
+        {
+          "tau": 0.1,
+          "z_max_abs": 0.7261034010808358,
+          "z_rmse": 0.12205413293598913,
+          "class_kl_sym_mean": 6.757636958256008e-05,
+          "class_max_abs": 0.021255120019335494,
+          "argmax_agreement": 0.9555555555555556
+        },
+        {
+          "tau": 0.03,
+          "z_max_abs": 0.693806567572502,
+          "z_rmse": 0.06421750990414944,
+          "class_kl_sym_mean": 2.326544980642819e-05,
+          "class_max_abs": 0.01366183998292897,
+          "argmax_agreement": 0.9777777777777777
+        },
+        {
+          "tau": 0.01,
+          "z_max_abs": 0.7269220141400374,
+          "z_rmse": 0.03302855843094661,
+          "class_kl_sym_mean": 4.132988120989017e-06,
+          "class_max_abs": 0.004385313723817341,
+          "argmax_agreement": 0.9777777777777777
+        },
+        {
+          "tau": 0.003,
+          "z_max_abs": 0.5494438795079268,
+          "z_rmse": 0.0154724943878062,
+          "class_kl_sym_mean": 5.5337887393610694e-08,
+          "class_max_abs": 0.000362421371832955,
+          "argmax_agreement": 0.9777777777777777
+        },
+        {
+          "tau": 0.001,
+          "z_max_abs": 0.3795299021233595,
+          "z_rmse": 0.011744620949305916,
+          "class_kl_sym_mean": 1.285269030006095e-10,
+          "class_max_abs": 3.467404437190735e-05,
+          "argmax_agreement": 1.0
+        }
+      ]
+    },
+    {
+      "dataset": "Wine",
+      "n_branches": 167,
+      "n_test": 54,
+      "rows": [
+        {
+          "tau": 1.0,
+          "z_max_abs": 0.9989434597778287,
+          "z_rmse": 0.25064843509420737,
+          "class_kl_sym_mean": 0.0,
+          "class_max_abs": 0.0,
+          "argmax_agreement": 1.0
+        },
+        {
+          "tau": 0.3,
+          "z_max_abs": 0.9973947756648527,
+          "z_rmse": 0.18268094944515878,
+          "class_kl_sym_mean": 0.0,
+          "class_max_abs": 0.0,
+          "argmax_agreement": 1.0
+        },
+        {
+          "tau": 0.1,
+          "z_max_abs": 0.9989003599928623,
+          "z_rmse": 0.13832064364271368,
+          "class_kl_sym_mean": 0.0,
+          "class_max_abs": 0.0,
+          "argmax_agreement": 1.0
+        },
+        {
+          "tau": 0.03,
+          "z_max_abs": 0.9989072608603096,
+          "z_rmse": 0.12037739209684603,
+          "class_kl_sym_mean": 0.0,
+          "class_max_abs": 0.0,
+          "argmax_agreement": 1.0
+        },
+        {
+          "tau": 0.01,
+          "z_max_abs": 0.9989072608603096,
+          "z_rmse": 0.11441371830274648,
+          "class_kl_sym_mean": 0.0,
+          "class_max_abs": 0.0,
+          "argmax_agreement": 1.0
+        },
+        {
+          "tau": 0.003,
+          "z_max_abs": 0.9989072608603096,
+          "z_rmse": 0.11282733627090516,
+          "class_kl_sym_mean": 0.0,
+          "class_max_abs": 0.0,
+          "argmax_agreement": 1.0
+        },
+        {
+          "tau": 0.001,
+          "z_max_abs": 0.9989072608603096,
+          "z_rmse": 0.11207520843088041,
+          "class_kl_sym_mean": 0.0,
+          "class_max_abs": 0.0,
+          "argmax_agreement": 1.0
+        }
+      ]
+    }
+  ],
+  "E2_xor_independence": {
+    "best_noisy_or_acc": 0.75,
+    "bayes_optimal_acc": 1.0,
+    "irreducible_gap": 0.25,
+    "best_theta": [
+      [
+        0.0,
+        0.05
+      ],
+      [
+        0.05,
+        0.0
+      ]
+    ],
+    "n": 800
+  },
+  "E3_depth_likelihood": {
+    "rows": [
+      {
+        "p_high": 0.95,
+        "p_low": 0.05,
+        "depth": 1,
+        "p_high_per_cond": 0.95,
+        "p_low_per_cond": 0.05,
+        "per_cond_log_lr": 2.9444389791664403,
+        "branch_log_lr_all_fire": 2.9444389791664403,
+        "z_post_all_fire_from_prior_0.5": 0.9500000000000001
+      },
+      {
+        "p_high": 0.95,
+        "p_low": 0.05,
+        "depth": 2,
+        "p_high_per_cond": 0.9746794344808963,
+        "p_low_per_cond": 0.22360679774997896,
+        "per_cond_log_lr": 1.4722194895832201,
+        "branch_log_lr_all_fire": 2.9444389791664403,
+        "z_post_all_fire_from_prior_0.5": 0.9500000000000001
+      },
+      {
+        "p_high": 0.95,
+        "p_low": 0.05,
+        "depth": 3,
+        "p_high_per_cond": 0.9830475724915585,
+        "p_low_per_cond": 0.3684031498640387,
+        "per_cond_log_lr": 0.9814796597221467,
+        "branch_log_lr_all_fire": 2.9444389791664403,
+        "z_post_all_fire_from_prior_0.5": 0.9500000000000001
+      },
+      {
+        "p_high": 0.95,
+        "p_low": 0.05,
+        "depth": 4,
+        "p_high_per_cond": 0.9872585449014338,
+        "p_low_per_cond": 0.4728708045015879,
+        "per_cond_log_lr": 0.7361097447916102,
+        "branch_log_lr_all_fire": 2.9444389791664407,
+        "z_post_all_fire_from_prior_0.5": 0.9500000000000001
+      },
+      {
+        "p_high": 0.95,
+        "p_low": 0.05,
+        "depth": 5,
+        "p_high_per_cond": 0.9897937816869885,
+        "p_low_per_cond": 0.5492802716530588,
+        "per_cond_log_lr": 0.5888877958332882,
+        "branch_log_lr_all_fire": 2.944438979166441,
+        "z_post_all_fire_from_prior_0.5": 0.9500000000000001
+      },
+      {
+        "p_high": 0.95,
+        "p_low": 0.05,
+        "depth": 6,
+        "p_high_per_cond": 0.9914875553891529,
+        "p_low_per_cond": 0.6069622310029172,
+        "per_cond_log_lr": 0.49073982986107334,
+        "branch_log_lr_all_fire": 2.9444389791664403,
+        "z_post_all_fire_from_prior_0.5": 0.9500000000000001
+      },
+      {
+        "p_high": 0.99,
+        "p_low": 0.01,
+        "depth": 1,
+        "p_high_per_cond": 0.99,
+        "p_low_per_cond": 0.01,
+        "per_cond_log_lr": 4.59511985013459,
+        "branch_log_lr_all_fire": 4.59511985013459,
+        "z_post_all_fire_from_prior_0.5": 0.99
+      },
+      {
+        "p_high": 0.99,
+        "p_low": 0.01,
+        "depth": 2,
+        "p_high_per_cond": 0.99498743710662,
+        "p_low_per_cond": 0.1,
+        "per_cond_log_lr": 2.297559925067295,
+        "branch_log_lr_all_fire": 4.59511985013459,
+        "z_post_all_fire_from_prior_0.5": 0.99
+      },
+      {
+        "p_high": 0.99,
+        "p_low": 0.01,
+        "depth": 3,
+        "p_high_per_cond": 0.9966554934125964,
+        "p_low_per_cond": 0.2154434690031884,
+        "per_cond_log_lr": 1.5317066167115299,
+        "branch_log_lr_all_fire": 4.59511985013459,
+        "z_post_all_fire_from_prior_0.5": 0.99
+      },
+      {
+        "p_high": 0.99,
+        "p_low": 0.01,
+        "depth": 4,
+        "p_high_per_cond": 0.9974905699336811,
+        "p_low_per_cond": 0.31622776601683794,
+        "per_cond_log_lr": 1.1487799625336474,
+        "branch_log_lr_all_fire": 4.59511985013459,
+        "z_post_all_fire_from_prior_0.5": 0.99
+      },
+      {
+        "p_high": 0.99,
+        "p_low": 0.01,
+        "depth": 5,
+        "p_high_per_cond": 0.9979919516614258,
+        "p_low_per_cond": 0.39810717055349726,
+        "per_cond_log_lr": 0.9190239700269179,
+        "branch_log_lr_all_fire": 4.59511985013459,
+        "z_post_all_fire_from_prior_0.5": 0.99
+      },
+      {
+        "p_high": 0.99,
+        "p_low": 0.01,
+        "depth": 6,
+        "p_high_per_cond": 0.9983263461476896,
+        "p_low_per_cond": 0.4641588833612779,
+        "per_cond_log_lr": 0.765853308355765,
+        "branch_log_lr_all_fire": 4.595119850134591,
+        "z_post_all_fire_from_prior_0.5": 0.99
+      },
+      {
+        "p_high": 0.8,
+        "p_low": 0.2,
+        "depth": 1,
+        "p_high_per_cond": 0.8,
+        "p_low_per_cond": 0.2,
+        "per_cond_log_lr": 1.3862943611198906,
+        "branch_log_lr_all_fire": 1.3862943611198906,
+        "z_post_all_fire_from_prior_0.5": 0.8
+      },
+      {
+        "p_high": 0.8,
+        "p_low": 0.2,
+        "depth": 2,
+        "p_high_per_cond": 0.8944271909999159,
+        "p_low_per_cond": 0.4472135954999579,
+        "per_cond_log_lr": 0.6931471805599453,
+        "branch_log_lr_all_fire": 1.3862943611198906,
+        "z_post_all_fire_from_prior_0.5": 0.8
+      },
+      {
+        "p_high": 0.8,
+        "p_low": 0.2,
+        "depth": 3,
+        "p_high_per_cond": 0.9283177667225558,
+        "p_low_per_cond": 0.5848035476425733,
+        "per_cond_log_lr": 0.4620981203732968,
+        "branch_log_lr_all_fire": 1.3862943611198904,
+        "z_post_all_fire_from_prior_0.5": 0.8
+      },
+      {
+        "p_high": 0.8,
+        "p_low": 0.2,
+        "depth": 4,
+        "p_high_per_cond": 0.9457416090031758,
+        "p_low_per_cond": 0.668740304976422,
+        "per_cond_log_lr": 0.3465735902799727,
+        "branch_log_lr_all_fire": 1.3862943611198908,
+        "z_post_all_fire_from_prior_0.5": 0.8
+      },
+      {
+        "p_high": 0.8,
+        "p_low": 0.2,
+        "depth": 5,
+        "p_high_per_cond": 0.956352499790037,
+        "p_low_per_cond": 0.7247796636776955,
+        "per_cond_log_lr": 0.2772588722239781,
+        "branch_log_lr_all_fire": 1.3862943611198906,
+        "z_post_all_fire_from_prior_0.5": 0.8
+      },
+      {
+        "p_high": 0.8,
+        "p_low": 0.2,
+        "depth": 6,
+        "p_high_per_cond": 0.9634924839989961,
+        "p_low_per_cond": 0.76472449133173,
+        "per_cond_log_lr": 0.23104906018664845,
+        "branch_log_lr_all_fire": 1.3862943611198908,
+        "z_post_all_fire_from_prior_0.5": 0.8
+      }
+    ]
+  },
+  "E4_branch_independence": [
+    {
+      "dataset": "Iris",
+      "n_branches": 74,
+      "n_pairs": 2701,
+      "mean_excess_dependence": 0.0019191284663975239,
+      "max_abs_excess_dependence": 0.01716160774230957,
+      "frac_pairs_above_0.05": 0.0
+    },
+    {
+      "dataset": "Wine",
+      "n_branches": 167,
+      "n_pairs": 13861,
+      "mean_excess_dependence": 2.7050280550611205e-05,
+      "max_abs_excess_dependence": 0.006546735763549805,
+      "frac_pairs_above_0.05": 0.0
+    }
+  ]
+}

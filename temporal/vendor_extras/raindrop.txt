@@ -1,0 +1,12 @@
+# Raindrop (mims-harvard/Raindrop)
+# Adapter: VendoredRaindropBaseline (PyTorch + PyG).
+#
+# Upstream pins ancient torch==1.9.0+cu102; we relax to modern torch
+# and pull in torch_geometric (graph attention layer is the core of
+# Raindrop).  The baseline hard-codes ``.cuda()`` so a CUDA-capable
+# GPU is required at fit time — without it the adapter raises a
+# clear RuntimeError and compare_temporal.py logs ``[skipped]``.
+torch
+numpy
+scikit-learn
+torch_geometric

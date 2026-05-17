@@ -1,0 +1,12 @@
+# mTAN (reml-lab/mTAN)
+# Adapter: VendoredMTANBaseline (PyTorch).
+#
+# Upstream pins `torch==1.4.0`/`torchvision==0.5.0` for repro of the
+# 2020 NeurIPS submission, but the exposed `enc_mtan_classif` module
+# is forward-compatible with modern PyTorch (we have validated
+# torch>=2.0 in our smoke tests).  We therefore keep the deps loose
+# so the vendored baseline runs against the same torch as everything
+# else in the comparison.
+torch
+numpy
+scikit-learn

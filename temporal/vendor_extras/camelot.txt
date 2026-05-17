@@ -1,0 +1,16 @@
+# CAMELOT (hrna-ox/camelot-icml)
+# Adapter: VendoredCAMELOTBaseline (TensorFlow / Keras).
+#
+# The upstream requirements.txt is broken (contains unresolved
+# git-merge conflict markers, see vendor/camelot/requirements.txt),
+# so we curate our own dependency list here.
+#
+# The model is pure Keras ≥ 2.4 + a few classical-ML helpers
+# (sacred for run logging is upstream-only and NOT required by the
+# adapter — we deliberately drop it).
+tensorflow>=2.10,<2.16
+scikit-learn
+tslearn
+scipy
+numpy
+pandas
