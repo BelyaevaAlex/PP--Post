@@ -1,4 +1,6 @@
-"""§6.1 — L4 ablations: fix the per-timestep RuleNetwork backbone and
+"""§6.1 — temporal ablations for PPtheta-Post.
+
+Main track: fix the per-timestep RuleNetwork backbone and
 sweep over temporal aggregation modes and their hyper-parameters.
 
 Unlike :mod:`compare_temporal`, this driver does **not** vary the
@@ -22,6 +24,14 @@ Output
   variant × fold).
 * Final aggregated CSV ``output/temporal/ablations_<timestamp>_summary.csv``
   with mean ± std per variant.
+
+Optional feature-teacher track
+------------------------------
+Pass ``--include-ts-feature-teacher`` to add L2T/L3T variants where
+TabPFN-style forecasting/residual features are distilled into the flat
+PPtheta-Post student.  This mirrors the tabular TabPFN-distill recipe:
+the teacher guides the feature space used to grow branches, while the
+RuleNetwork/PPtheta-Post head is trained against the original labels.
 """
 
 from __future__ import annotations
@@ -50,6 +60,8 @@ from .compare_temporal import (  # noqa: E402
     FoldResult,
     _aggregate,
     _evaluate,
+    run_l2_ts_teacher,
+    run_l3_ts_teacher,
 )
 from .datasets import load_temporal_dataset  # noqa: E402
 from .pp_theta_post_temporal import PPThetaPostTemporal  # noqa: E402
@@ -223,6 +235,51 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--epochs", type=int, default=60)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument(
+        "--include-ts-feature-teacher",
+        action="store_true",
+        help="Append L2T/L3T TabPFN-style temporal feature-teacher "
+             "ablation rows alongside the fixed-L4 aggregation sweep.",
+    )
+    p.add_argument(
+        "--ts-teacher-levels", nargs="+", default=["L2T", "L3T"],
+        help="Feature-teacher levels to run when "
+             "--include-ts-feature-teacher is set.",
+    )
+    p.add_argument(
+        "--ts-teacher-backend",
+        choices=["auto", "tabpfn_ts", "tabpfn", "extratrees"],
+        default="tabpfn_ts",
+        help="Backend for L2T/L3T feature-teacher variants.",
+    )
+    p.add_argument(
+        "--ts-teacher-max-rows", type=int, default=4096,
+        help="Maximum transition rows used by the ExtraTrees teacher.",
+    )
+    p.add_argument(
+        "--ts-teacher-model-path", default=None,
+        help="Path to the downloaded TabPFN-TS checkpoint.",
+    )
+    p.add_argument(
+        "--ts-teacher-device", default="cpu",
+        help="Device passed to TabPFN-TS LOCAL mode.",
+    )
+    p.add_argument(
+        "--ts-teacher-n-estimators", type=int, default=8,
+        help="Number of TabPFN estimators used by the TabPFN-TS teacher.",
+    )
+    p.add_argument(
+        "--ts-teacher-workers", type=int, default=1,
+        help="CPU worker count inside tabpfn_time_series.",
+    )
+    p.add_argument(
+        "--n-windows", type=int, default=4,
+        help="Number of windows for L2T when feature-teacher rows run.",
+    )
+    p.add_argument(
+        "--n-intervals", type=int, default=10,
+        help="Number of intervals for L3T when feature-teacher rows run.",
+    )
+    p.add_argument(
         "--output-dir",
         default=os.path.join(THIS_DIR, "..", "output", "temporal"),
     )
@@ -247,6 +304,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     md.write(f"Datasets: {args.datasets} | folds: {args.folds} | "
              f"epochs: {args.epochs}\n")
+    if args.include_ts_feature_teacher:
+        md.write(
+            f"\nFeature-teacher rows: {args.ts_teacher_levels} | "
+            f"backend: {args.ts_teacher_backend} | "
+            f"max_rows: {args.ts_teacher_max_rows}\n"
+        )
 
     all_per_fold: List[AblationFoldResult] = []
 
@@ -261,12 +324,55 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         per_variant: Dict[str, List[FoldResult]] = {}
         for fold_idx, (train_idx, val_idx) in enumerate(skf.split(X_ts, y)):
             print(f"  fold {fold_idx + 1}/{args.folds}")
+            X_tr_ts, mask_tr, y_tr = (
+                X_ts[train_idx], mask[train_idx], y[train_idx]
+            )
+            X_va_ts, mask_va, y_va = (
+                X_ts[val_idx], mask[val_idx], y[val_idx]
+            )
             results = run_l4_ablation_one_fold(
-                X_ts[train_idx], mask[train_idx], y[train_idx],
-                X_ts[val_idx], mask[val_idx], y[val_idx],
+                X_tr_ts, mask_tr, y_tr,
+                X_va_ts, mask_va, y_va,
                 var_names=var_names, n_classes=n_classes,
                 seed=args.seed, epochs=args.epochs,
             )
+            if args.include_ts_feature_teacher:
+                teacher_levels = {
+                    str(level).upper() for level in args.ts_teacher_levels
+                }
+                if "L2T" in teacher_levels:
+                    try:
+                        results.update(run_l2_ts_teacher(
+                            X_tr_ts, mask_tr, y_tr,
+                            X_va_ts, mask_va, y_va,
+                            n_classes=n_classes, seed=args.seed,
+                            epochs=args.epochs, n_windows=args.n_windows,
+                            teacher_backend=args.ts_teacher_backend,
+                            teacher_max_rows=args.ts_teacher_max_rows,
+                            teacher_model_path=args.ts_teacher_model_path,
+                            teacher_device=args.ts_teacher_device,
+                            teacher_n_estimators=args.ts_teacher_n_estimators,
+                            teacher_num_workers=args.ts_teacher_workers,
+                        ))
+                    except (RuntimeError, ImportError) as exc:
+                        print(f"    [skipped] L2T feature teacher: {exc}")
+                if "L3T" in teacher_levels:
+                    try:
+                        results.update(run_l3_ts_teacher(
+                            X_tr_ts, mask_tr, y_tr,
+                            X_va_ts, mask_va, y_va,
+                            var_names=var_names, n_classes=n_classes,
+                            seed=args.seed, epochs=args.epochs,
+                            n_intervals=args.n_intervals,
+                            teacher_backend=args.ts_teacher_backend,
+                            teacher_max_rows=args.ts_teacher_max_rows,
+                            teacher_model_path=args.ts_teacher_model_path,
+                            teacher_device=args.ts_teacher_device,
+                            teacher_n_estimators=args.ts_teacher_n_estimators,
+                            teacher_num_workers=args.ts_teacher_workers,
+                        ))
+                    except (RuntimeError, ImportError) as exc:
+                        print(f"    [skipped] L3T feature teacher: {exc}")
             for variant_name, fold_result in results.items():
                 per_variant.setdefault(variant_name, []).append(fold_result)
                 all_per_fold.append(AblationFoldResult(

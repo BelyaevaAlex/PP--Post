@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Paper Section 08: temporal benchmark and optional vendored baselines."""
+"""Paper Section 08: temporal benchmark and optional vendored baselines.
+
+Includes the L2T/L3T temporal feature-teacher rows.  These use
+TabPFN-style forecasting/residual features as a training-time teacher
+for the PPtheta-Post student, mirroring the tabular TabPFN-distill
+section while keeping inference symbolic.
+"""
 
 from __future__ import annotations
 
@@ -14,6 +20,10 @@ from temporal.compare_temporal import main as run_temporal  # noqa: E402
 
 
 DEFAULT_ARGS = [
+    "--levels",
+    "L1", "L2", "L2T", "L3", "L3T", "L4",
+    "--ts-teacher-backend",
+    "tabpfn_ts",
     "--output-dir",
     str(ROOT / "output" / "paper" / "08_temporal_main"),
 ]
@@ -25,4 +35,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

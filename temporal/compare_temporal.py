@@ -27,8 +27,12 @@ Usage
 
     python -m temporal.compare_temporal \\
         --datasets p12 pam mimic3 \\
-        --levels L1 L2 L3 L4 \\
+        --levels L1 L2 L2T L3 L3T L4 \\
         --folds 3 --epochs 80
+
+``L2T`` / ``L3T`` are TabPFN-style temporal feature-teacher variants:
+the teacher emits forecasting/residual features on the training fold and
+the usual PPθ-Post student distils them into symbolic branches.
 
 The script writes a Markdown summary table to
 ``output/temporal/<datestamp>.md`` and a per-row CSV with mean ± std.
@@ -84,6 +88,7 @@ from .baselines_vendored_tf import (  # noqa: E402
     make_vendored_tf,
 )
 from .pp_theta_post_temporal import PPThetaPostTemporal  # noqa: E402
+from .tabpfn_ts_teacher import TabPFNTSFeatureTeacher  # noqa: E402
 from .tabularize import multi_window_flatten, summary_flatten  # noqa: E402
 from .temporal_inference import (  # noqa: E402
     DEFAULT_TEMPORAL_VARIANTS,
@@ -278,6 +283,116 @@ def run_l3(
     X_val = extractor.transform(X_val_ts, mask_val)
     return _run_static_levels_on_features(
         "L3", X_train, y_train, X_val, y_val, n_classes, seed, epochs,
+    )
+
+
+def _teacher_backend_label(teacher: TabPFNTSFeatureTeacher) -> str:
+    labels = {
+        "tabpfn_ts": "TabPFNTS",
+        "tabpfn": "TabPFNTS",
+        "extratrees": "ForecastTeacherET",
+        "constant": "ForecastTeacherConst",
+    }
+    return labels.get(teacher.backend_used or teacher.backend, teacher.backend)
+
+
+def _augment_with_ts_teacher(
+    X_train_base: np.ndarray,
+    X_val_base: np.ndarray,
+    X_train_ts: np.ndarray,
+    mask_train: np.ndarray,
+    X_val_ts: np.ndarray,
+    mask_val: np.ndarray,
+    seed: int,
+    backend: str,
+    max_rows: int,
+    model_path: Optional[str],
+    device: str,
+    n_estimators: int,
+    num_workers: int,
+) -> Tuple[np.ndarray, np.ndarray, TabPFNTSFeatureTeacher]:
+    teacher = TabPFNTSFeatureTeacher(
+        backend=backend,
+        seed=seed,
+        max_regression_rows=max_rows,
+        tabpfn_ts_model_path=model_path,
+        tabpfn_ts_device=device,
+        tabpfn_estimators=n_estimators,
+        tabpfn_ts_num_workers=num_workers,
+    ).fit(X_train_ts, mask_train)
+    X_train_aug = np.concatenate(
+        [X_train_base, teacher.transform(X_train_ts, mask_train)], axis=1,
+    )
+    X_val_aug = np.concatenate(
+        [X_val_base, teacher.transform(X_val_ts, mask_val)], axis=1,
+    )
+    return X_train_aug, X_val_aug, teacher
+
+
+def run_l2_ts_teacher(
+    X_train_ts: np.ndarray, mask_train: np.ndarray, y_train: np.ndarray,
+    X_val_ts: np.ndarray, mask_val: np.ndarray, y_val: np.ndarray,
+    n_classes: int, seed: int, epochs: int, n_windows: int,
+    teacher_backend: str = "auto", teacher_max_rows: int = 4096,
+    teacher_model_path: Optional[str] = None, teacher_device: str = "cpu",
+    teacher_n_estimators: int = 8, teacher_num_workers: int = 1,
+) -> Dict[str, FoldResult]:
+    """L2 + TabPFN-style temporal feature teacher.
+
+    The teacher is fitted only on the training fold, emits
+    forecasting/residual features for train and validation splits, and is
+    then dropped.  The symbolic branch structure is still extracted from
+    the PPtheta-Post student trained on the augmented flat matrix.
+    """
+    X_train_base = multi_window_flatten(
+        X_train_ts, mask_train, n_windows=n_windows,
+    )
+    X_val_base = multi_window_flatten(
+        X_val_ts, mask_val, n_windows=n_windows,
+    )
+    X_train, X_val, teacher = _augment_with_ts_teacher(
+        X_train_base, X_val_base,
+        X_train_ts, mask_train, X_val_ts, mask_val,
+        seed=seed, backend=teacher_backend, max_rows=teacher_max_rows,
+        model_path=teacher_model_path, device=teacher_device,
+        n_estimators=teacher_n_estimators,
+        num_workers=teacher_num_workers,
+    )
+    label = f"L2T-{_teacher_backend_label(teacher)}"
+    return _run_static_levels_on_features(
+        label, X_train, y_train, X_val, y_val, n_classes, seed, epochs,
+    )
+
+
+def run_l3_ts_teacher(
+    X_train_ts: np.ndarray, mask_train: np.ndarray, y_train: np.ndarray,
+    X_val_ts: np.ndarray, mask_val: np.ndarray, y_val: np.ndarray,
+    var_names: Sequence[str], n_classes: int, seed: int, epochs: int,
+    n_intervals: int, teacher_backend: str = "auto",
+    teacher_max_rows: int = 4096,
+    teacher_model_path: Optional[str] = None, teacher_device: str = "cpu",
+    teacher_n_estimators: int = 8, teacher_num_workers: int = 1,
+) -> Dict[str, FoldResult]:
+    """L3 interval features + TabPFN-style temporal feature teacher."""
+    extractor = IntervalFeatureExtractor(
+        var_names=var_names,
+        T=X_train_ts.shape[1],
+        n_intervals=n_intervals,
+        seed=seed,
+    )
+    X_train_base = extractor.transform(X_train_ts, mask_train)
+    X_val_base = extractor.transform(X_val_ts, mask_val)
+    X_train, X_val, teacher = _augment_with_ts_teacher(
+        X_train_base, X_val_base,
+        X_train_ts, mask_train, X_val_ts, mask_val,
+        seed=seed, backend=teacher_backend, max_rows=teacher_max_rows,
+        model_path=teacher_model_path, device=teacher_device,
+        n_estimators=teacher_n_estimators,
+        num_workers=teacher_num_workers,
+    )
+    label = f"L3T-{_teacher_backend_label(teacher)}"
+    return _run_static_levels_on_features(
+        label, X_train, y_train, X_val, y_val, n_classes, seed, epochs,
     )
 
 
@@ -478,7 +593,9 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                    help="Subset of registered temporal datasets to run.")
     p.add_argument("--levels", nargs="+",
                    default=["L1", "L2", "L3", "L4"],
-                   help="Subset of temporal levels to evaluate.")
+                   help="Subset of temporal levels to evaluate. "
+                        "Use L2T / L3T for TabPFN-style temporal "
+                        "feature-teacher distillation variants.")
     p.add_argument(
         "--baselines", nargs="*", default=[],
         help="External baselines to add alongside L1-L4. "
@@ -498,6 +615,42 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                    help="Number of windows for L2.")
     p.add_argument("--n-intervals", type=int, default=10,
                    help="Number of random intervals for L3.")
+    p.add_argument(
+        "--ts-teacher-backend",
+        choices=["auto", "tabpfn_ts", "tabpfn", "extratrees"],
+        default="tabpfn_ts",
+        help="Backend for L2T/L3T feature-teacher variants. "
+             "`tabpfn_ts` uses tabpfn_time_series.TabPFNTSPipeline "
+             "with local Prior-Labs/tabpfn_3 weights; "
+             "`extratrees` is a local smoke-test backend; `auto` tries "
+             "TabPFN and falls back to ExtraTrees.",
+    )
+    p.add_argument(
+        "--ts-teacher-max-rows", type=int, default=4096,
+        help="Maximum lag-to-next transition rows used to fit the "
+             "ExtraTrees smoke-test teacher per fold.",
+    )
+    p.add_argument(
+        "--ts-teacher-model-path", default=None,
+        help="Path to the downloaded TabPFN-TS checkpoint. Defaults to "
+             "TABPFN_TS_MODEL_PATH or the download script cache path.",
+    )
+    p.add_argument(
+        "--ts-teacher-device", default="cpu",
+        help="Device passed to TabPFN-TS LOCAL mode (default: cpu).",
+    )
+    p.add_argument(
+        "--ts-teacher-n-estimators", type=int, default=8,
+        help="Number of TabPFN estimators used by the TabPFN-TS teacher.",
+    )
+    p.add_argument(
+        "--ts-teacher-workers", type=int, default=1,
+        help=(
+            "CPU worker count inside tabpfn_time_series. Default 1 avoids "
+            "loky/semaphore issues in sandboxed macOS runs; increase for "
+            "paper-scale local runs if the machine supports it."
+        ),
+    )
     p.add_argument("--n-l4-variants", type=int, default=4,
                    help="Number of L4 inference variants to evaluate "
                         "(taken from DEFAULT_TEMPORAL_VARIANTS).")
@@ -509,6 +662,7 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _parse_args(argv)
+    level_keys = {str(level).upper() for level in args.levels}
     os.makedirs(args.output_dir, exist_ok=True)
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     md_path = os.path.join(args.output_dir, f"compare_temporal_{timestamp}.md")
@@ -554,6 +708,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     md_buf.write(f"Levels: {args.levels} | folds: {args.folds} | "
                  f"epochs: {args.epochs}")
+    if {"L2T", "L3T"} & level_keys:
+        md_buf.write(
+            f" | ts_teacher_backend: {args.ts_teacher_backend}"
+            f" | ts_teacher_max_rows: {args.ts_teacher_max_rows}"
+            f" | ts_teacher_workers: {args.ts_teacher_workers}"
+        )
     if baseline_keys:
         md_buf.write(f" | baselines: {baseline_keys}")
     md_buf.write("\n")
@@ -575,21 +735,37 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             X_va_ts, mask_va, y_va = X_ts[val_idx], mask[val_idx], y[val_idx]
 
             results: Dict[str, FoldResult] = {}
-            if "L1" in args.levels:
+            if "L1" in level_keys:
                 results.update(run_l1(
                     X_tr_ts, mask_tr, y_tr,
                     X_va_ts, mask_va, y_va,
                     n_classes=n_classes, seed=args.seed,
                     epochs=args.epochs,
                 ))
-            if "L2" in args.levels:
+            if "L2" in level_keys:
                 results.update(run_l2(
                     X_tr_ts, mask_tr, y_tr,
                     X_va_ts, mask_va, y_va,
                     n_classes=n_classes, seed=args.seed,
                     epochs=args.epochs, n_windows=args.n_windows,
                 ))
-            if "L3" in args.levels:
+            if "L2T" in level_keys:
+                try:
+                    results.update(run_l2_ts_teacher(
+                        X_tr_ts, mask_tr, y_tr,
+                        X_va_ts, mask_va, y_va,
+                        n_classes=n_classes, seed=args.seed,
+                        epochs=args.epochs, n_windows=args.n_windows,
+                        teacher_backend=args.ts_teacher_backend,
+                        teacher_max_rows=args.ts_teacher_max_rows,
+                        teacher_model_path=args.ts_teacher_model_path,
+                        teacher_device=args.ts_teacher_device,
+                        teacher_n_estimators=args.ts_teacher_n_estimators,
+                        teacher_num_workers=args.ts_teacher_workers,
+                    ))
+                except (RuntimeError, ImportError) as exc:
+                    print(f"    [skipped] L2T feature teacher: {exc}")
+            if "L3" in level_keys:
                 results.update(run_l3(
                     X_tr_ts, mask_tr, y_tr,
                     X_va_ts, mask_va, y_va,
@@ -597,7 +773,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     seed=args.seed, epochs=args.epochs,
                     n_intervals=args.n_intervals,
                 ))
-            if "L4" in args.levels:
+            if "L3T" in level_keys:
+                try:
+                    results.update(run_l3_ts_teacher(
+                        X_tr_ts, mask_tr, y_tr,
+                        X_va_ts, mask_va, y_va,
+                        var_names=var_names, n_classes=n_classes,
+                        seed=args.seed, epochs=args.epochs,
+                        n_intervals=args.n_intervals,
+                        teacher_backend=args.ts_teacher_backend,
+                        teacher_max_rows=args.ts_teacher_max_rows,
+                        teacher_model_path=args.ts_teacher_model_path,
+                        teacher_device=args.ts_teacher_device,
+                        teacher_n_estimators=args.ts_teacher_n_estimators,
+                        teacher_num_workers=args.ts_teacher_workers,
+                    ))
+                except (RuntimeError, ImportError) as exc:
+                    print(f"    [skipped] L3T feature teacher: {exc}")
+            if "L4" in level_keys:
                 results.update(run_l4(
                     X_tr_ts, mask_tr, y_tr,
                     X_va_ts, mask_va, y_va,

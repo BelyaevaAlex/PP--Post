@@ -15,10 +15,10 @@ Categories:
       multiclass and we propagate that as ``NotImplementedError`` so the
       driver surfaces a clean ``[skip]``).
     * **TabPFN** — :class:`TabPFNBaseline` (tabpfn); prior-fitted
-      transformer for small tabular datasets.  v1 enforces ``n ≤ 1000``
-      and ``d ≤ 100``; v2 lifts those caps but downloads a ~200 MB HF
-      checkpoint on first use.  The adapter raises ``NotImplementedError``
-      with the offending shape so the driver can skip cleanly.
+      transformer for small tabular datasets.  v3 checkpoints are gated
+      on Hugging Face, so the adapter can consume a local checkpoint via
+      ``model_path``, ``TABPFN_CLASSIFIER_MODEL_PATH`` or
+      ``TABPFN_MODEL_PATH``.
 
 All adapters share the contract::
 
@@ -40,6 +40,7 @@ the bootstrap convention copied from :mod:`temporal.baselines_vendored`.
 
 from __future__ import annotations
 
+import os
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -202,12 +203,15 @@ class TabPFNBaseline(TabularBaselineBase):
     name = "tabpfn"
 
     def _fit(self, X, y, *, n_classes, seed):
+        if str(self.kwargs.get("device", "cpu")).lower() == "cpu":
+            os.environ.setdefault("TABPFN_EXCLUDE_DEVICES", "mps")
         try:
             from tabpfn import TabPFNClassifier
         except ImportError as e:
             raise ImportError(
-                "tabpfn is not installed.  `pip install tabpfn` "
-                "(downloads a ~200 MB checkpoint on first use)."
+                "tabpfn is not installed.  `pip install -r requirements.txt` "
+                "and download gated weights with "
+                "`python download_tabpfn_ts_weights.py --kind classifier`."
             ) from e
 
         n, d = X.shape
@@ -224,6 +228,14 @@ class TabPFNBaseline(TabularBaselineBase):
             device=self.kwargs.get("device", "cpu"),
             random_state=seed,
         )
+        model_path = (
+            self.kwargs.get("model_path")
+            or os.environ.get("TABPFN_CLASSIFIER_MODEL_PATH")
+            or os.environ.get("TABPFN_MODEL_PATH")
+        )
+        if model_path:
+            params["model_path"] = model_path
+        params["show_progress_bar"] = self.kwargs.get("show_progress_bar", False)
         # TabPFN v2 takes (n_estimators, ignore_pretraining_limits) extras.
         if "n_estimators" in self.kwargs:
             params["n_estimators"] = self.kwargs["n_estimators"]

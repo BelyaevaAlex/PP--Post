@@ -22,5 +22,8 @@ imodels>=2.0
 interpret>=0.5
 # TabPFN: standalone baseline + tabpfn_distill_{xgb,et,cb} rule sources
 #         + pl_ens_tabpfn / pl_ens_distill ensemble variants.
-# Pin to v2.x — v8 requires a PriorLabs license token at runtime.
-tabpfn>=2,<3
+# TabPFN-Time-Series: temporal L2T/L3T feature-teacher distillation
+# with local gated weights from Prior-Labs/tabpfn_3.
+tabpfn>=8,<9
+tabpfn-time-series>=1.1,<2
+huggingface-hub>=0.25

@@ -434,7 +434,9 @@ inference variants from the static pipeline.
 |------|------|----------------------|
 | **L1** | Per-variable summary stats `(mean, std, min, max, first, last, slope, count, frac_obs)` | None — pipeline runs as-is on the flat feature vector |
 | **L2** | Multi-window summary stats + cross-window deltas | None — only feature engineering |
+| **L2T** | L2 plus TabPFN-style temporal feature teacher | Forecasting/residual features are added at training time, then distilled into the same symbolic PPθ-Post student |
 | **L3** | Time-Series-Forest backbone over random intervals × `{mean, std, slope}` | Trees split on interval features; metadata table maps `feature_idx → (var, interval, stat)` |
+| **L3T** | L3 plus TabPFN-style temporal feature teacher | Interval rules get extra teacher features without changing the downstream branch / ProbLog schema |
 | **L4** | Per-timestep latent `z(b, X, t)` + temporal aggregation | `PPThetaPostTemporal` runs condition-aware rule activation on `[N*T, 2V]` snapshots, aggregates over time |
 
 ### 10.2 L3 — temporal ProbLog atoms
@@ -454,7 +456,44 @@ The `feature_meta` table is consumed by
 `export_temporal_problog_program` without any change to `Branch` /
 `Condition`.
 
-### 10.3 L4 — per-timestep latent + temporal aggregation
+### 10.3 L2T / L3T — temporal feature-teacher distillation
+
+`temporal.tabpfn_ts_teacher.TabPFNTSFeatureTeacher` mirrors the tabular
+TabPFN-distill recipe in a forecasting setting.  The preferred backend
+uses `tabpfn_time_series.TabPFNTSPipeline` in LOCAL mode with the gated
+`Prior-Labs/tabpfn_3` time-series checkpoint.  It emits per-variable
+forecast, forecast-delta and residual/uncertainty features and is then
+dropped.  The RuleNetwork/PPθ-Post student is trained against the
+original class labels, so branch statistics remain grounded in `(X, y)`
+rather than teacher pseudo-labels.
+
+Download weights once after accepting the Hugging Face terms:
+
+```bash
+python download_tabpfn_ts_weights.py --kind ts
+python download_tabpfn_ts_weights.py --kind classifier   # optional tabular TabPFN
+```
+
+Backends:
+
+| Backend | Use |
+|---|---|
+| `tabpfn_ts` | native `tabpfn_time_series.TabPFNTSPipeline` with local `tabpfn-v3-regressor-v3_20260506_timeseries.ckpt` |
+| `extratrees` | local deterministic backend for smoke tests / offline runs |
+| `auto` | try `tabpfn_ts`, fall back to `extratrees` with a warning; useful only for offline smoke tests |
+
+Example:
+
+```bash
+python -m temporal.compare_temporal \
+  --datasets p12 pam \
+  --levels L2 L2T L3 L3T \
+  --ts-teacher-backend tabpfn_ts \
+  --ts-teacher-model-path "$TABPFN_TS_MODEL_PATH" \
+  --ts-teacher-workers 1
+```
+
+### 10.4 L4 — per-timestep latent + temporal aggregation
 
 ```
 ExtraTreesClassifier(snapshots [N·T, 2V])
@@ -493,7 +532,7 @@ z_overall(b0,X) :- z(b0,X,_).
 `k_of_T` are computed analytically by
 `temporal_inference.aggregate_z_over_time`.
 
-### 10.4 Default L4 inference variants
+### 10.5 Default L4 inference variants
 
 Registered in `temporal.temporal_inference.DEFAULT_TEMPORAL_VARIANTS`:
 
@@ -518,23 +557,24 @@ Registered in `temporal.temporal_inference.DEFAULT_TEMPORAL_VARIANTS`:
 > discriminative power.  For paper-scale benchmarks prefer
 > `PL-tNoisyOr-top10`, `PL-kOfT-50`, or `PL-tAttn{PB,MH}`.
 
-### 10.5 Datasets and comparison drivers
+### 10.6 Datasets and comparison drivers
 
 - `temporal.datasets.load_temporal_dataset("p12" | "pam" | "mimic3")` —
   synthetic loaders that mirror the structure of PhysioNet 2012, PAMAP2
   and mimic3-benchmarks (mortality task) at laptop scale.  Real loaders
   drop into the same registry once credentialing is in place.
 - `python -m temporal.compare_temporal --datasets p12 pam mimic3
-  --levels L1 L2 L3 L4 --folds 3 --epochs 80` — **intra-method
+  --levels L1 L2 L2T L3 L3T L4 --folds 3 --epochs 80` — **intra-method
   ablation** across PPθ-Post temporal levels.  Markdown summary saved to
   `output/temporal/compare_temporal_<timestamp>.md`.
 - Same driver with `--baselines lr xgb transformer sand mtan gru_d
   seft raindrop camelot interp_gn` (or `--baselines all`) appends 10
   external baselines to the report.  All SOTA rows run from the
   *authors' original code* (`temporal/vendor/*`) — see §10.7.
-- `python -m temporal.ablations --datasets pam` — fixes the L4 backbone
-  and sweeps only over aggregation modes / hyper-parameters
-  (`top_k_time`, attention modes, k-of-T thresholds).
+- `python -m temporal.ablations --datasets pam
+  --include-ts-feature-teacher` — fixes the L4 backbone and sweeps over
+  aggregation modes / hyper-parameters (`top_k_time`, attention modes,
+  k-of-T thresholds), then appends L2T/L3T feature-teacher rows.
 - `python -m temporal.case_studies --dataset p12 --level L3 --top-k 5`
   — emits human-readable top-K rules per sample as JSON for the paper /
   supplementary.
@@ -555,11 +595,12 @@ Registered in `temporal.temporal_inference.DEFAULT_TEMPORAL_VARIANTS`:
 > forest so the full program compiles in seconds — no information is
 > discarded.
 
-### 10.6 Tests
+### 10.6.1 Tests
 
 ```
 python -m temporal.tests.test_tabularize                # L1 / L2 shapes
 python -m temporal.tests.test_interval_forest           # L3 backbone + meta
+python -m temporal.tests.test_tabpfn_ts_teacher         # L2T / L3T teacher features
 python -m temporal.tests.test_temporal_problog          # L3 / L4 ProbLog export
 python -m temporal.tests.test_pp_theta_post_temporal    # L4 fit / predict / aggregations / multi-head attention
 python -m temporal.tests.test_problog_spotcheck         # full-program ProbLog ↔ analytical parity
@@ -685,7 +726,7 @@ competitor reference.  Tagged in the CSV as `rule_source=_standalone`.
 | `ebm` | `EBMBaseline` | `interpret.glassbox.ExplainableBoostingClassifier` | Current glass-box SOTA on tabular data |
 | `figs` | `FIGSBaseline` | `imodels.FIGSClassifier` | Same upstream as the `figs` rule source, but used standalone (no `build_model_from_branches`) |
 | `rulefit` | `RuleFitBaseline` | `imodels.RuleFitClassifier` | Binary only |
-| `tabpfn` | `TabPFNBaseline` | [`tabpfn.TabPFNClassifier`](https://github.com/PriorLabs/TabPFN) | v2.x ships an offline checkpoint (~200 MB); v8 requires a PriorLabs license token, so we pin `tabpfn>=2,<3` |
+| `tabpfn` | `TabPFNBaseline` | [`tabpfn.TabPFNClassifier`](https://github.com/PriorLabs/TabPFN) | v3 local checkpoint via `TABPFN_CLASSIFIER_MODEL_PATH`; download with `python download_tabpfn_ts_weights.py --kind classifier` |
 
 #### 10.8.3 TabPFN-distill rule sources
 

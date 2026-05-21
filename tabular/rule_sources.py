@@ -844,12 +844,16 @@ class TabPFNDistillRuleSource(RuleSource):
     name = "tabpfn_distill"
 
     def _fit(self, X, y, *, n_features, n_classes, seed):
+        tabpfn_kwargs = dict(self.kwargs.get("tabpfn_kwargs", {}))
+        if str(tabpfn_kwargs.get("device", "cpu")).lower() == "cpu":
+            os.environ.setdefault("TABPFN_EXCLUDE_DEVICES", "mps")
         try:
             from tabpfn import TabPFNClassifier
         except ImportError as e:
             raise ImportError(
-                "tabpfn is not installed.  `pip install \"tabpfn>=2,<3\"` "
-                "(downloads a ~200 MB checkpoint on first use)."
+                "tabpfn is not installed.  `pip install -r requirements.txt` "
+                "and download gated weights with "
+                "`python download_tabpfn_ts_weights.py --kind classifier`."
             ) from e
 
         student_key = str(self.kwargs.get("student", "xgb")).lower()
@@ -860,9 +864,16 @@ class TabPFNDistillRuleSource(RuleSource):
             )
 
         # 1. Teacher: TabPFN.
-        tabpfn_kwargs = dict(self.kwargs.get("tabpfn_kwargs", {}))
         tabpfn_kwargs.setdefault("device", "cpu")
         tabpfn_kwargs.setdefault("random_state", seed)
+        model_path = (
+            tabpfn_kwargs.get("model_path")
+            or os.environ.get("TABPFN_CLASSIFIER_MODEL_PATH")
+            or os.environ.get("TABPFN_MODEL_PATH")
+        )
+        if model_path:
+            tabpfn_kwargs["model_path"] = model_path
+        tabpfn_kwargs.setdefault("show_progress_bar", False)
         import inspect
         sig = inspect.signature(TabPFNClassifier.__init__)
         teacher = TabPFNClassifier(
