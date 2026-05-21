@@ -1729,11 +1729,62 @@ def compute_entropy_gate(
 # ═════════════════════════════════════════════════════════════
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import math
 
 
-class DifferentiablePosterior:
+def aggregate_calibrated_noisy_or(
+    z: np.ndarray,
+    theta: np.ndarray,
+    leak: Optional[np.ndarray] = None,
+    class_bias: Optional[np.ndarray] = None,
+    temperature: float = 1.0,
+    branch_gate: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Noisy-or with class leak, class bias, temperature and branch gates.
+
+    This is the NumPy inference counterpart of the calibrated e2e-NoisyOr
+    training path.  The raw noisy-or class evidences are converted to logits
+    with ``log(p_class) + class_bias`` and normalised by a softmax temperature.
+    """
+    z = np.asarray(z, dtype=np.float64)
+    if z.ndim == 1:
+        z = z[np.newaxis, :]
+    theta = np.asarray(theta, dtype=np.float64)
+    if branch_gate is not None:
+        gate = np.asarray(branch_gate, dtype=np.float64).reshape(1, -1)
+        z = z * np.clip(gate, 0.0, 1.0)
+
+    n_classes = theta.shape[1]
+    leak_arr = (
+        np.zeros(n_classes, dtype=np.float64)
+        if leak is None
+        else np.asarray(leak, dtype=np.float64).reshape(-1)
+    )
+    bias_arr = (
+        np.zeros(n_classes, dtype=np.float64)
+        if class_bias is None
+        else np.asarray(class_bias, dtype=np.float64).reshape(-1)
+    )
+    if leak_arr.shape[0] != n_classes:
+        raise ValueError("leak must have one value per class")
+    if bias_arr.shape[0] != n_classes:
+        raise ValueError("class_bias must have one value per class")
+
+    p_support = z[:, :, np.newaxis] * theta[np.newaxis, :, :]
+    log_no_event = np.log1p(-np.clip(p_support, 0.0, 1.0 - 1e-15)).sum(axis=1)
+    log_no_event += np.log1p(-np.clip(leak_arr, 0.0, 1.0 - 1e-15))[np.newaxis, :]
+    class_prob = np.clip(1.0 - np.exp(log_no_event), 1e-15, 1.0)
+
+    temp = max(float(temperature), 1e-6)
+    logits = (np.log(class_prob) + bias_arr[np.newaxis, :]) / temp
+    logits = logits - logits.max(axis=1, keepdims=True)
+    proba = np.exp(logits)
+    return proba / np.maximum(proba.sum(axis=1, keepdims=True), 1e-15)
+
+
+class DifferentiablePosterior(nn.Module):
     """Differentiable Bayesian posterior P(z|evidence) in PyTorch.
 
     Converts the analytical posterior computation into a fully
@@ -1754,11 +1805,17 @@ class DifferentiablePosterior:
         p_high: float = 0.95,
         p_low: float = 0.05,
         tau: float = 0.1,
+        learn_reliability: bool = False,
+        reliability_init: float = 1.0,
+        reliability_max: float = 2.0,
     ):
+        super().__init__()
         self.branches = branches
         self.p_high = p_high
         self.p_low = p_low
         self.tau = tau
+        self.learn_reliability = bool(learn_reliability)
+        self.reliability_max = float(max(reliability_max, 1e-6))
 
         # Pre-extract all conditions into flat tensors for vectorization
         all_feat_idx = []
@@ -1769,7 +1826,7 @@ class DifferentiablePosterior:
 
         for b_idx, branch in enumerate(branches):
             n_conds = len(branch.conditions)
-            branch_n_conds.append(max(n_conds, 1))
+            branch_n_conds.append(n_conds)
             for cond in branch.conditions:
                 all_feat_idx.append(cond.feature_idx)
                 all_threshold.append(cond.threshold)
@@ -1779,37 +1836,101 @@ class DifferentiablePosterior:
         self.n_branches = len(branches)
         self.n_total_conds = len(all_feat_idx)
 
-        if self.n_total_conds == 0:
-            # Edge case: no conditions at all
-            self._has_conditions = False
-            return
+        self._has_conditions = self.n_total_conds > 0
 
-        self._has_conditions = True
-
-        self.feat_idx = torch.tensor(all_feat_idx, dtype=torch.long)
-        self.threshold = torch.tensor(all_threshold, dtype=torch.float32)
-        self.direction = torch.tensor(all_direction, dtype=torch.float32)
-        self.branch_idx = torch.tensor(all_branch_idx, dtype=torch.long)
+        self.register_buffer("feat_idx", torch.tensor(all_feat_idx, dtype=torch.long))
+        self.register_buffer("threshold", torch.tensor(all_threshold, dtype=torch.float32))
+        self.register_buffer("direction", torch.tensor(all_direction, dtype=torch.float32))
+        self.register_buffer("branch_idx", torch.tensor(all_branch_idx, dtype=torch.long))
+        self.register_buffer(
+            "branch_n_conds",
+            torch.tensor(branch_n_conds, dtype=torch.float32),
+        )
 
         # Depth-adjusted per-condition log-probabilities
         # For condition c belonging to branch b with m_b conditions:
         #   p_h = p_high^(1/m_b),   p_l = p_low^(1/m_b)
+        safe_branch_n_conds = [max(n, 1) for n in branch_n_conds]
         p_h_per_cond = torch.tensor(
-            [p_high ** (1.0 / branch_n_conds[bi]) for bi in all_branch_idx],
+            [p_high ** (1.0 / safe_branch_n_conds[bi]) for bi in all_branch_idx],
             dtype=torch.float32,
         )
         p_l_per_cond = torch.tensor(
-            [p_low ** (1.0 / branch_n_conds[bi]) for bi in all_branch_idx],
+            [p_low ** (1.0 / safe_branch_n_conds[bi]) for bi in all_branch_idx],
             dtype=torch.float32,
         )
 
         # Pre-compute log constants (these are fixed, no gradient needed)
-        self.log_ph = torch.log(p_h_per_cond)              # log(p_h)
-        self.log_1m_ph = torch.log(1.0 - p_h_per_cond)     # log(1 - p_h)
-        self.log_pl = torch.log(p_l_per_cond)               # log(p_l)
-        self.log_1m_pl = torch.log(1.0 - p_l_per_cond)      # log(1 - p_l)
+        self.register_buffer("log_ph", torch.log(p_h_per_cond))
+        self.register_buffer("log_1m_ph", torch.log(1.0 - p_h_per_cond))
+        self.register_buffer("log_pl", torch.log(p_l_per_cond))
+        self.register_buffer("log_1m_pl", torch.log(1.0 - p_l_per_cond))
 
-    def __call__(
+        if self.learn_reliability:
+            init = float(np.clip(reliability_init / self.reliability_max, 1e-4, 1.0 - 1e-4))
+            init_logit = math.log(init / (1.0 - init))
+            self.evidence_reliability_logit = nn.Parameter(
+                torch.full((self.n_branches,), init_logit, dtype=torch.float32)
+            )
+        else:
+            self.register_parameter("evidence_reliability_logit", None)
+
+    def evidence_reliability(self) -> torch.Tensor:
+        """Return per-branch evidence scale r_b.
+
+        ``r_b = 1`` recovers the fixed Bayesian posterior.  Values below one
+        temper noisy evidence; values above one let reliable branches sharpen
+        the posterior.  The scale is bounded for stable paper sweeps.
+        """
+        if self.evidence_reliability_logit is None:
+            return torch.ones(self.n_branches, dtype=torch.float32, device=self.branch_n_conds.device)
+        return self.reliability_max * torch.sigmoid(self.evidence_reliability_logit)
+
+    def evidence_regularization(self) -> torch.Tensor:
+        """Small prior that keeps learned evidence reliability near 1."""
+        r = self.evidence_reliability()
+        return (r - 1.0).pow(2).mean()
+
+    def _condition_match(self, X: torch.Tensor) -> torch.Tensor:
+        X_sel = X[:, self.feat_idx.to(X.device)]
+        diff = self.direction.to(X.device).unsqueeze(0) * (
+            self.threshold.to(X.device).unsqueeze(0) - X_sel
+        )
+        return torch.sigmoid(diff / self.tau)
+
+    def branch_truth(
+        self,
+        X: torch.Tensor,
+        soft_and: str = "geomean",
+    ) -> torch.Tensor:
+        """Differentiable branch-condition truth target for auxiliary losses."""
+        out = X.new_ones((X.shape[0], self.n_branches))
+        if not self._has_conditions:
+            return out
+        match = self._condition_match(X)
+        branch_exp = self.branch_idx.to(X.device).unsqueeze(0).expand(X.shape[0], -1)
+        has_conditions = self.branch_n_conds.to(X.device) > 0
+        n_safe = self.branch_n_conds.to(X.device).clamp_min(1.0).unsqueeze(0)
+
+        if soft_and == "product":
+            log_match = torch.log(match.clamp_min(1e-12))
+            acc = X.new_zeros((X.shape[0], self.n_branches))
+            acc.scatter_add_(1, branch_exp, log_match)
+            out[:, has_conditions] = torch.exp(acc[:, has_conditions])
+        elif soft_and == "mean":
+            acc = X.new_zeros((X.shape[0], self.n_branches))
+            acc.scatter_add_(1, branch_exp, match)
+            out[:, has_conditions] = (acc / n_safe)[:, has_conditions]
+        elif soft_and == "geomean":
+            log_match = torch.log(match.clamp_min(1e-12))
+            acc = X.new_zeros((X.shape[0], self.n_branches))
+            acc.scatter_add_(1, branch_exp, log_match)
+            out[:, has_conditions] = torch.exp((acc / n_safe)[:, has_conditions])
+        else:
+            raise ValueError(f"Unsupported soft_and: {soft_and}")
+        return out.clamp(0.0, 1.0)
+
+    def forward(
         self,
         z_prior: torch.Tensor,
         X: torch.Tensor,
@@ -1865,40 +1986,41 @@ class DifferentiablePosterior:
                     "match": None, "log_lik_z1_cond": None, "log_lik_z0_cond": None,
                     "cond_log_lr": None, "log_lik_z1": None, "log_lik_z0": None,
                     "log_evidence": None, "branch_idx": self.branch_idx,
+                    "evidence_reliability": self.evidence_reliability(),
                 }
             return z_prior
 
         batch_size = z_prior.shape[0]
 
         # ── Soft condition evaluation (differentiable) ──────────
-        # X_sel: [batch, n_total_conds]
-        X_sel = X[:, self.feat_idx]
-
-        # diff > 0  when condition is satisfied
-        # "le":  threshold - x  > 0  when x <= threshold
-        # "gt":  x - threshold  > 0  when x > threshold
-        diff = self.direction.unsqueeze(0) * (
-            self.threshold.unsqueeze(0) - X_sel
-        )
-        match = torch.sigmoid(diff / self.tau)  # [batch, n_total_conds]
+        match = self._condition_match(X)  # [batch, n_total_conds]
 
         # ── Per-condition log-likelihoods ───────────────────────
         # P(obs|z=1): match·p_h + (1-match)·(1-p_h)
+        log_ph = self.log_ph.to(X.device).unsqueeze(0)
+        log_1m_ph = self.log_1m_ph.to(X.device).unsqueeze(0)
+        log_pl = self.log_pl.to(X.device).unsqueeze(0)
+        log_1m_pl = self.log_1m_pl.to(X.device).unsqueeze(0)
         log_lik_z1_cond = (
-            match * self.log_ph.unsqueeze(0)
-            + (1 - match) * self.log_1m_ph.unsqueeze(0)
+            match * log_ph
+            + (1 - match) * log_1m_ph
         )  # [batch, n_total_conds]
 
         log_lik_z0_cond = (
-            match * self.log_pl.unsqueeze(0)
-            + (1 - match) * self.log_1m_pl.unsqueeze(0)
+            match * log_pl
+            + (1 - match) * log_1m_pl
         )  # [batch, n_total_conds]
 
-        # ── Scatter-add to branches ─────────────────────────────
-        log_lik_z1 = torch.zeros(batch_size, self.n_branches)
-        log_lik_z0 = torch.zeros(batch_size, self.n_branches)
+        r_branch = self.evidence_reliability().to(X.device)
+        r_cond = r_branch[self.branch_idx.to(X.device)].unsqueeze(0)
+        log_lik_z1_cond = log_lik_z1_cond * r_cond
+        log_lik_z0_cond = log_lik_z0_cond * r_cond
 
-        branch_exp = self.branch_idx.unsqueeze(0).expand(batch_size, -1)
+        # ── Scatter-add to branches ─────────────────────────────
+        log_lik_z1 = z_prior.new_zeros(batch_size, self.n_branches)
+        log_lik_z0 = z_prior.new_zeros(batch_size, self.n_branches)
+
+        branch_exp = self.branch_idx.to(X.device).unsqueeze(0).expand(batch_size, -1)
         log_lik_z1.scatter_add_(1, branch_exp, log_lik_z1_cond)
         log_lik_z0.scatter_add_(1, branch_exp, log_lik_z0_cond)
 
@@ -1929,5 +2051,6 @@ class DifferentiablePosterior:
             "log_lik_z0": log_lik_z0,
             "log_evidence": log_evidence,
             "branch_idx": self.branch_idx,
+            "evidence_reliability": r_branch,
         }
         return z_posterior, info

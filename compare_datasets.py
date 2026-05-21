@@ -37,6 +37,7 @@ Expensive variants are opt-in:
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import datetime as dt
 import json
@@ -80,6 +81,7 @@ from sklearn.preprocessing import LabelEncoder
 from problog_inference import (
     DifferentiablePosterior,
     ProbLogClassifier,
+    aggregate_calibrated_noisy_or,
     aggregate_noisy_or,
     aggregate_weighted_mean,
     aggregate_weighted_mean_alpha,
@@ -129,7 +131,11 @@ CORE_VARIANTS = (
 EXPENSIVE_VARIANTS = (
     "theta_learn",
     "pp_theta_post_e2e",
+    "pp_theta_post_warm",
+    "pp_theta_post_aux",
+    "pp_theta_post_learn_evidence",
     "e2e_noisy_or",
+    "calibrated_e2e_noisy_or",
     "pl_ens_tabpfn",
     "pl_ens_distill",
 )
@@ -146,7 +152,11 @@ VARIANT_LABELS = {
     "pl_wmean": "PL-wmean",
     "theta_learn": "ThetaLearn",
     "pp_theta_post_e2e": "PPtheta-Post",
+    "pp_theta_post_warm": "PPtheta-Post-Warm",
+    "pp_theta_post_aux": "PPtheta-Post+Aux",
+    "pp_theta_post_learn_evidence": "PPtheta-Post+LearnEv",
     "e2e_noisy_or": "e2e-NoisyOr",
+    "calibrated_e2e_noisy_or": "Cal-e2e-NoisyOr",
     "pl_ens_tabpfn": "PL-Ens(TabPFN)",
     "pl_ens_distill": "PL-Ens(Distill)",
 }
@@ -293,9 +303,21 @@ def predict_diff_posterior_wmean_chunks(
     batch_size: int,
     tau: float = 0.1,
 ) -> np.ndarray:
+    evidence_reliability = getattr(model, "posterior_evidence_reliability_", None)
     diff_post = DifferentiablePosterior(
-        model.branches, p_high=0.95, p_low=0.05, tau=tau,
+        model.branches,
+        p_high=0.95,
+        p_low=0.05,
+        tau=tau,
+        learn_reliability=evidence_reliability is not None,
     )
+    if evidence_reliability is not None and diff_post.evidence_reliability_logit is not None:
+        r = np.asarray(evidence_reliability, dtype=np.float32)
+        r_scaled = np.clip(r / diff_post.reliability_max, 1e-4, 1.0 - 1e-4)
+        with torch.no_grad():
+            diff_post.evidence_reliability_logit.copy_(
+                torch.log(torch.from_numpy(r_scaled) / (1.0 - torch.from_numpy(r_scaled)))
+            )
     theta_t = torch.from_numpy(theta).float()
     chunks = []
     for sl, bp in branch_probs_chunks(model, X, batch_size):
@@ -325,6 +347,34 @@ def predict_diff_posterior_noisy_or_chunks(
             x_t = torch.from_numpy(X[sl]).float()
             z = diff_post(bp_t, x_t).detach().cpu().numpy()
         chunks.append(aggregate_noisy_or(z, theta))
+    return normalize_proba(np.vstack(chunks))
+
+
+def predict_calibrated_diff_posterior_noisy_or_chunks(
+    model: RuleNetworkModel,
+    X: np.ndarray,
+    theta: np.ndarray,
+    calibration: Dict[str, np.ndarray],
+    batch_size: int,
+    tau: float = 0.1,
+) -> np.ndarray:
+    diff_post = DifferentiablePosterior(
+        model.branches, p_high=0.95, p_low=0.05, tau=tau,
+    )
+    chunks = []
+    for sl, bp in branch_probs_chunks(model, X, batch_size):
+        with torch.no_grad():
+            bp_t = torch.from_numpy(bp).float()
+            x_t = torch.from_numpy(X[sl]).float()
+            z = diff_post(bp_t, x_t).detach().cpu().numpy()
+        chunks.append(aggregate_calibrated_noisy_or(
+            z,
+            theta,
+            leak=calibration.get("leak"),
+            class_bias=calibration.get("class_bias"),
+            temperature=float(calibration.get("temperature", 1.0)),
+            branch_gate=calibration.get("branch_gate"),
+        ))
     return normalize_proba(np.vstack(chunks))
 
 
@@ -1069,6 +1119,124 @@ def _run_variants_for_source(
             len(model_e2e.branches), top_k, cfg, rule_source=source_name,
         )
 
+    if "pp_theta_post_warm" in cfg.variants:
+        X_sub, y_sub = select_expensive_training_subset(X_train, y_train, cfg, seed)
+        t0 = time.time()
+        pre_epochs = max(1, cfg.expensive_epochs // 2)
+
+        warm_candidates = []
+
+        # PPθ warm start: align W1 and θ with the probabilistic weighted-mean head.
+        model_pp = copy.deepcopy(model)
+        theta_pp = theta.copy()
+        model_pp, theta_pp = model_pp.fit_problog_pure_theta(
+            X_sub, y_sub, X_test, y_test, theta_pp,
+            epochs=pre_epochs,
+        )
+        proba_pp = predict_diff_posterior_wmean_chunks(
+            model_pp, X_test, theta_pp, cfg.batch_size,
+        )
+        warm_candidates.append((
+            log_loss(y_test, proba_pp, labels=list(range(n_classes))),
+            "PPtheta",
+            model_pp,
+            theta_pp,
+        ))
+
+        # DH7 warm start: dual-head training with λ=0.7, matching the
+        # strongest legacy DH7-800 family but using the configured epoch budget.
+        model_dh = copy.deepcopy(model)
+        theta_dh = theta.copy()
+        model_dh.fit_dual_head(
+            X_sub, y_sub, X_test, y_test, theta_dh,
+            epochs=pre_epochs,
+            lambda_w2=0.7,
+        )
+        proba_dh = predict_diff_posterior_wmean_chunks(
+            model_dh, X_test, theta_dh, cfg.batch_size,
+        )
+        warm_candidates.append((
+            log_loss(y_test, proba_dh, labels=list(range(n_classes))),
+            "DH7",
+            model_dh,
+            theta_dh,
+        ))
+
+        warm_candidates.sort(key=lambda item: item[0])
+        _, warm_name, model_warm, theta_warm = warm_candidates[0]
+        print(f"    PPtheta-Post-Warm start={warm_name}")
+
+        model_warm, theta_warm = model_warm.fit_problog_posterior_e2e(
+            X_sub, y_sub, X_test, y_test, theta_warm,
+            epochs=cfg.expensive_epochs,
+            batch_size=cfg.train_batch_size,
+        )
+        fit_secs = time.time() - t0
+        t0 = time.time()
+        proba = predict_diff_posterior_wmean_chunks(
+            model_warm, X_test, theta_warm, cfg.batch_size,
+        )
+        evaluate_and_stream(
+            rows, csv_path, jsonl_path, ds.name, fold, "pp_theta_post_warm",
+            y_test, proba, n_classes, fit_secs, time.time() - t0,
+            len(model_warm.branches), top_k, cfg, rule_source=source_name,
+        )
+
+    if "pp_theta_post_aux" in cfg.variants:
+        X_sub, y_sub = select_expensive_training_subset(X_train, y_train, cfg, seed)
+        t0 = time.time()
+        model_aux = RuleNetworkModel(task="classification")
+        model_aux.build_model_from_branches(
+            fitted.branches_per_tree,
+            in_features=n_features,
+            out_features=n_classes,
+        )
+        theta_init = build_theta_matrix(model_aux.branches, n_classes)
+        model_aux, theta_aux = model_aux.fit_problog_posterior_e2e(
+            X_sub, y_sub, X_test, y_test, theta_init,
+            epochs=cfg.expensive_epochs,
+            batch_size=cfg.train_batch_size,
+            aux_branch_weight=0.05,
+        )
+        fit_secs = time.time() - t0
+        t0 = time.time()
+        proba = predict_diff_posterior_wmean_chunks(
+            model_aux, X_test, theta_aux, cfg.batch_size,
+        )
+        evaluate_and_stream(
+            rows, csv_path, jsonl_path, ds.name, fold, "pp_theta_post_aux",
+            y_test, proba, n_classes, fit_secs, time.time() - t0,
+            len(model_aux.branches), top_k, cfg, rule_source=source_name,
+        )
+
+    if "pp_theta_post_learn_evidence" in cfg.variants:
+        X_sub, y_sub = select_expensive_training_subset(X_train, y_train, cfg, seed)
+        t0 = time.time()
+        model_lev = RuleNetworkModel(task="classification")
+        model_lev.build_model_from_branches(
+            fitted.branches_per_tree,
+            in_features=n_features,
+            out_features=n_classes,
+        )
+        theta_init = build_theta_matrix(model_lev.branches, n_classes)
+        model_lev, theta_lev = model_lev.fit_problog_posterior_e2e(
+            X_sub, y_sub, X_test, y_test, theta_init,
+            epochs=cfg.expensive_epochs,
+            batch_size=cfg.train_batch_size,
+            learn_evidence=True,
+            evidence_reg_weight=1e-3,
+        )
+        fit_secs = time.time() - t0
+        t0 = time.time()
+        proba = predict_diff_posterior_wmean_chunks(
+            model_lev, X_test, theta_lev, cfg.batch_size,
+        )
+        evaluate_and_stream(
+            rows, csv_path, jsonl_path, ds.name, fold, "pp_theta_post_learn_evidence",
+            y_test, proba, n_classes, fit_secs, time.time() - t0,
+            len(model_lev.branches), top_k, cfg, rule_source=source_name,
+        )
+
     if "e2e_noisy_or" in cfg.variants:
         X_sub, y_sub = select_expensive_training_subset(X_train, y_train, cfg, seed)
         t0 = time.time()
@@ -1095,6 +1263,32 @@ def _run_variants_for_source(
             rows, csv_path, jsonl_path, ds.name, fold, "e2e_noisy_or",
             y_test, proba, n_classes, fit_secs, time.time() - t0,
             len(model_nor.branches), top_k, cfg, rule_source=source_name,
+        )
+
+    if "calibrated_e2e_noisy_or" in cfg.variants:
+        X_sub, y_sub = select_expensive_training_subset(X_train, y_train, cfg, seed)
+        t0 = time.time()
+        model_cal = RuleNetworkModel(task="classification")
+        model_cal.build_model_from_branches(
+            fitted.branches_per_tree,
+            in_features=n_features,
+            out_features=n_classes,
+        )
+        theta_init = build_theta_matrix(model_cal.branches, n_classes)
+        model_cal, theta_cal, calibration = model_cal.fit_calibrated_e2e_noisy_or(
+            X_sub, y_sub, X_test, y_test, theta_init,
+            epochs=cfg.expensive_epochs,
+            batch_size=cfg.train_batch_size,
+        )
+        fit_secs = time.time() - t0
+        t0 = time.time()
+        proba = predict_calibrated_diff_posterior_noisy_or_chunks(
+            model_cal, X_test, theta_cal, calibration, cfg.batch_size,
+        )
+        evaluate_and_stream(
+            rows, csv_path, jsonl_path, ds.name, fold, "calibrated_e2e_noisy_or",
+            y_test, proba, n_classes, fit_secs, time.time() - t0,
+            len(model_cal.branches), top_k, cfg, rule_source=source_name,
         )
 
     if "pl_ens_tabpfn" in cfg.variants and tabpfn_cache is not None:

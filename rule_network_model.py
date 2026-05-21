@@ -1008,6 +1008,10 @@ class RuleNetworkModel(RuleNetwork):
         lr: float = 0.01,
         tau: float = 0.1,
         batch_size: int = 256,
+        aux_branch_weight: float = 0.0,
+        aux_soft_and: str = "geomean",
+        learn_evidence: bool = False,
+        evidence_reg_weight: float = 1e-3,
     ) -> Tuple["RuleNetworkModel", np.ndarray]:
         """Train W1 + θ end-to-end with **differentiable Bayesian posterior**.
 
@@ -1047,16 +1051,21 @@ class RuleNetworkModel(RuleNetwork):
 
         # Differentiable posterior module
         diff_post = DifferentiablePosterior(
-            self.branches, p_high=0.95, p_low=0.05, tau=tau
-        )
+            self.branches,
+            p_high=0.95,
+            p_low=0.05,
+            tau=tau,
+            learn_reliability=learn_evidence,
+        ).to(self.device)
 
         # θ as trainable parameter (logit-space)
         th_logit = torch.nn.Parameter(
-            torch.log(torch.tensor(theta_np, dtype=torch.float32) + 1e-8)
+            torch.log(torch.tensor(theta_np, dtype=torch.float32) + 1e-8).to(self.device)
         )
 
+        extra_params = [th_logit] + list(diff_post.parameters())
         opt = torch.optim.Adam(
-            list(self.parameters()) + [th_logit], lr=lr
+            list(self.parameters()) + extra_params, lr=lr
         )
         sch = CosineAnnealingWarmRestarts(opt, T_0=180)
 
@@ -1094,6 +1103,22 @@ class RuleNetworkModel(RuleNetwork):
                 # Weighted mean aggregation with posterior z
                 p = (z_post @ th) / (z_post.sum(1, keepdim=True) + 1e-15)
                 loss = F.nll_loss(torch.log(p + 1e-15), yb)
+                if aux_branch_weight > 0:
+                    with torch.no_grad():
+                        branch_target = diff_post.branch_truth(
+                            xb, soft_and=aux_soft_and,
+                        )
+                    aux_loss = F.binary_cross_entropy(
+                        z_prior.clamp(1e-7, 1.0 - 1e-7),
+                        branch_target,
+                    )
+                    loss = loss + float(aux_branch_weight) * aux_loss
+                if learn_evidence and evidence_reg_weight > 0:
+                    loss = (
+                        loss
+                        + float(evidence_reg_weight)
+                        * diff_post.evidence_regularization()
+                    )
 
                 opt.zero_grad()
                 loss.backward()
@@ -1122,6 +1147,16 @@ class RuleNetworkModel(RuleNetwork):
                         yb_v,
                         reduction="sum",
                     )
+                    if aux_branch_weight > 0:
+                        branch_target_v = diff_post.branch_truth(
+                            xb_v, soft_and=aux_soft_and,
+                        )
+                        aux_v = F.binary_cross_entropy(
+                            z_prior_v.clamp(1e-7, 1.0 - 1e-7),
+                            branch_target_v,
+                            reduction="mean",
+                        )
+                        loss_v = loss_v + float(aux_branch_weight) * aux_v * len(yb_v)
                     val_loss += float(loss_v.item())
                     val_n += int(len(yb_v))
                 vl = val_loss / max(val_n, 1)
@@ -1129,8 +1164,15 @@ class RuleNetworkModel(RuleNetwork):
 
             if vl < best_vl:
                 best_vl = vl
-                best_state_ppth_post = copy.deepcopy(self.state_dict())
+                best_state_ppth_post = {
+                    "model": copy.deepcopy(self.state_dict()),
+                    "posterior": copy.deepcopy(diff_post.state_dict()),
+                }
                 best_th = F.softmax(th_logit, dim=1).detach().cpu().numpy()
+                self.posterior_evidence_reliability_ = (
+                    diff_post.evidence_reliability().detach().cpu().numpy()
+                    if learn_evidence else None
+                )
                 pat = 0
             else:
                 pat += 1
@@ -1138,9 +1180,14 @@ class RuleNetworkModel(RuleNetwork):
                 break
 
         if ep < epochs - 1 and best_state_ppth_post is not None:
-            self.load_state_dict(best_state_ppth_post)
+            self.load_state_dict(best_state_ppth_post["model"])
+            diff_post.load_state_dict(best_state_ppth_post["posterior"])
 
         self.eval()
+        if learn_evidence:
+            self.posterior_evidence_reliability_ = (
+                diff_post.evidence_reliability().detach().cpu().numpy()
+            )
         return self, best_th
 
     # ──────────────────────────────────────────────────────────
@@ -1376,3 +1423,161 @@ class RuleNetworkModel(RuleNetwork):
 
         self.eval()
         return self, best_th
+
+    def fit_calibrated_e2e_noisy_or(
+        self,
+        x_train: np.ndarray,
+        y_train: np.ndarray,
+        x_val: np.ndarray,
+        y_val: np.ndarray,
+        theta_np: np.ndarray,
+        epochs: int = 400,
+        lr: float = 0.01,
+        tau: float = 0.1,
+        batch_size: int = 256,
+        theta_reg_weight: float = 1e-3,
+        branch_gate_l1: float = 1e-4,
+    ) -> Tuple["RuleNetworkModel", np.ndarray, dict]:
+        """Calibrated e2e-NoisyOr with leak, class bias, temperature and gates.
+
+        This is intentionally a separate ablation path from
+        :meth:`fit_e2e_noisy_or`: the raw noisy-or evidence receives a
+        learnable class leak, a class bias, scalar temperature calibration,
+        and per-branch gates for weak-rule pruning.  θ is regularised toward
+        the forest-derived prior so the ablation stays comparable.
+        """
+        from problog_inference import DifferentiablePosterior
+
+        x_tr = torch.from_numpy(x_train).float()
+        y_tr = torch.from_numpy(y_train.ravel()).long()
+        x_v = torch.from_numpy(x_val).float()
+        y_v = torch.from_numpy(y_val.ravel()).long()
+
+        diff_post = DifferentiablePosterior(
+            self.branches, p_high=0.95, p_low=0.05, tau=tau,
+        ).to(self.device)
+
+        th_init = np.clip(theta_np.astype(np.float32), 1e-4, 1 - 1e-4)
+        th_init_t = torch.from_numpy(th_init).to(self.device)
+        th_logit = nn.Parameter(torch.log(th_init_t / (1.0 - th_init_t)))
+        leak_init = 1e-3
+        leak_logit = nn.Parameter(torch.full(
+            (theta_np.shape[1],),
+            np.log(leak_init / (1.0 - leak_init)),
+            dtype=torch.float32,
+            device=self.device,
+        ))
+        class_bias = nn.Parameter(torch.zeros(theta_np.shape[1], device=self.device))
+        temp_raw = nn.Parameter(torch.tensor(
+            np.log(np.exp(1.0) - 1.0),
+            dtype=torch.float32,
+            device=self.device,
+        ))
+        gate_init = 0.95
+        branch_gate_logit = nn.Parameter(torch.full(
+            (theta_np.shape[0],),
+            np.log(gate_init / (1.0 - gate_init)),
+            dtype=torch.float32,
+            device=self.device,
+        ))
+
+        opt = torch.optim.Adam(
+            list(self.parameters())
+            + [th_logit, leak_logit, class_bias, temp_raw, branch_gate_logit],
+            lr=lr,
+        )
+        sch = CosineAnnealingWarmRestarts(opt, T_0=180)
+
+        best_vl, pat = float("inf"), 0
+        best_state = None
+        best_theta = theta_np.copy()
+        best_calibration = {}
+        ds = TabularDataset(x_tr, y_tr.unsqueeze(1).float())
+        train_bs = max(1, min(int(batch_size), len(x_tr)))
+        loader = DataLoader(ds, batch_size=train_bs, shuffle=True, drop_last=True)
+        val_ds = TabularDataset(x_v, y_v.unsqueeze(1).float())
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=max(1, min(train_bs, len(x_v))),
+            shuffle=False,
+            drop_last=False,
+        )
+
+        EPS = 1e-12
+        CAP = 1.0 - 1e-6
+
+        def _current_params():
+            th = torch.sigmoid(th_logit)
+            leak = torch.sigmoid(leak_logit)
+            gate = torch.sigmoid(branch_gate_logit)
+            temp = F.softplus(temp_raw).clamp_min(1e-4)
+            return th, leak, gate, temp
+
+        def _logp(z: torch.Tensor) -> torch.Tensor:
+            th, leak, gate, temp = _current_params()
+            z_eff = z * gate.unsqueeze(0)
+            p_support = (z_eff.unsqueeze(2) * th.unsqueeze(0)).clamp(0.0, CAP)
+            log_no_event = torch.log1p(-p_support).sum(dim=1)
+            log_no_event = log_no_event + torch.log1p(-leak.clamp(0.0, CAP)).unsqueeze(0)
+            class_evidence = (1.0 - torch.exp(log_no_event)).clamp_min(EPS)
+            logits = (torch.log(class_evidence) + class_bias.unsqueeze(0)) / temp
+            return F.log_softmax(logits, dim=1)
+
+        pbar = tqdm(range(epochs), desc="Cal-e2e-NoisyOr")
+        for ep in pbar:
+            self.train()
+            el = 0.0
+            for xb, yb in loader:
+                xb = xb.to(self.device)
+                yb = yb.squeeze(1).long().to(self.device)
+                z_prior = torch.sigmoid(self.bn1(
+                    F.linear(self.bn0(xb), self.w1 * self.m1)))
+                z = diff_post(z_prior, xb)
+                loss = F.nll_loss(_logp(z), yb)
+                if theta_reg_weight > 0:
+                    th, _, gate, _ = _current_params()
+                    loss = loss + float(theta_reg_weight) * F.mse_loss(th, th_init_t)
+                    loss = loss + float(branch_gate_l1) * gate.mean()
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+                el += loss.item()
+            pbar.set_description(f"Cal-e2e-NoisyOr: {el/max(len(loader), 1):.4f}")
+
+            self.eval()
+            val_loss, val_n = 0.0, 0
+            with torch.no_grad():
+                for xb_v, yb_v in val_loader:
+                    xb_v = xb_v.to(self.device)
+                    yb_v = yb_v.squeeze(1).long().to(self.device)
+                    z_prior_v = torch.sigmoid(self.bn1(
+                        F.linear(self.bn0(xb_v), self.w1 * self.m1)))
+                    z_v = diff_post(z_prior_v, xb_v)
+                    loss_v = F.nll_loss(_logp(z_v), yb_v, reduction="sum")
+                    val_loss += float(loss_v.item())
+                    val_n += int(len(yb_v))
+                vl = val_loss / max(val_n, 1)
+            sch.step(vl)
+
+            if vl < best_vl:
+                best_vl = vl
+                best_state = copy.deepcopy(self.state_dict())
+                th, leak, gate, temp = _current_params()
+                best_theta = th.detach().cpu().numpy()
+                best_calibration = {
+                    "leak": leak.detach().cpu().numpy(),
+                    "class_bias": class_bias.detach().cpu().numpy(),
+                    "temperature": float(temp.detach().cpu().item()),
+                    "branch_gate": gate.detach().cpu().numpy(),
+                }
+                pat = 0
+            else:
+                pat += 1
+            if pat >= 100:
+                break
+
+        if best_state is not None:
+            self.load_state_dict(best_state)
+        self.noisy_or_calibration_ = best_calibration
+        self.eval()
+        return self, best_theta, best_calibration

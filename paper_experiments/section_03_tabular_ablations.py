@@ -6,15 +6,19 @@ Holds the symbolic backbone fixed (default ExtraTrees) and sweeps every
 inference variant — the 8 cheap ``core`` variants
 (``source_native``, ``neural``, ``condition_wmean``, ``hybrid_wmean``,
 ``hybrid_noisy_or``, ``pl_fast``, ``pl_full``, ``pl_wmean``) plus the
-3 expensive end-to-end variants (``theta_learn``,
-``pp_theta_post_e2e``, ``e2e_noisy_or``).  Each row tells you exactly
+expensive end-to-end variants (``theta_learn``, ``pp_theta_post_e2e``,
+``pp_theta_post_warm``, ``pp_theta_post_aux``,
+``pp_theta_post_learn_evidence``, ``e2e_noisy_or``,
+``calibrated_e2e_noisy_or`` and ensemble variants). Each row tells you exactly
 which component of PPθ-Post is doing the work on a given dataset.
 
 To isolate "what would I lose without component X?", read the gap
 between sibling rows (e.g. ``pl_fast`` vs ``pl_full`` quantifies the
 posterior update; ``pl_full`` vs ``pl_wmean`` quantifies noisy-or vs
-weighted-mean aggregation; ``pp_theta_post_e2e`` vs ``pl_wmean``
-quantifies end-to-end joint training of θ).
+weighted-mean aggregation; ``pp_theta_post_aux`` vs
+``pp_theta_post_e2e`` quantifies branch-truth supervision; and
+``pp_theta_post_learn_evidence`` tests whether evidence reliability should
+be learned instead of fixed).
 
 Default datasets: wine + breast_cancer + digits.  Override with
 ``--datasets`` for paper-scale runs.

@@ -2,8 +2,10 @@
 """Paper Section 02: tabular benchmark for the main PPθ-Post methods.
 
 Headline "the method works" run.  Sweeps the core inference variants
-plus the two expensive end-to-end variants (``pp_theta_post_e2e``,
-``e2e_noisy_or``) on the default ExtraTrees rule source.  Sections 03
+plus the expensive end-to-end/posterior variants (``pp_theta_post_e2e``,
+``pp_theta_post_warm``, ``pp_theta_post_aux``,
+``pp_theta_post_learn_evidence``, ``e2e_noisy_or`` and
+``calibrated_e2e_noisy_or``) on the default ExtraTrees rule source. Sections 03
 (ablations), 04 (rule sources), 05 (TabPFN distill), 06 (ensembles),
 and 07 (interpretability story) refine and extend it.
 """
@@ -22,7 +24,10 @@ from compare_datasets import main as run_compare_datasets  # noqa: E402
 
 DEFAULT_ARGS = [
     "--variants",
-    "core,pp_theta_post_e2e,e2e_noisy_or",
+    (
+        "core,pp_theta_post_e2e,pp_theta_post_warm,pp_theta_post_aux,"
+        "pp_theta_post_learn_evidence,e2e_noisy_or,calibrated_e2e_noisy_or"
+    ),
     "--output-dir",
     str(ROOT / "output" / "paper" / "02_tabular_main"),
 ]
@@ -34,4 +39,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

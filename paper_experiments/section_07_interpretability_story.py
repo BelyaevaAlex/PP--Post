@@ -74,7 +74,9 @@ DEFAULT_ARGS = [
     ),
     "--baselines", "ebm,tabpfn,figs,rulefit",
     "--variants", (
-        "source_native,pl_wmean,pl_full,pl_ens_distill,pl_ens_tabpfn"
+        "source_native,pl_wmean,pl_full,pp_theta_post_warm,"
+        "pp_theta_post_aux,pp_theta_post_learn_evidence,"
+        "calibrated_e2e_noisy_or,pl_ens_distill,pl_ens_tabpfn"
     ),
     "--distill-student", "et",
     "--ensemble-shrinkage", "0.3",
