@@ -13,15 +13,16 @@ experimental structure explicit and keep section-level defaults in one place.
 | TabPFN distillation | `section_05_tabular_tabpfn_distill.py` | `compare_datasets.py` | teacher-distilled rule sources and tabular distillation comparisons |
 | Tabular ensembles | `section_06_tabular_ensembles.py` | `compare_datasets.py` | interpretable and black-box ensemble variants |
 | Interpretability story | `section_07_interpretability_story.py` | `compare_datasets.py` | interpretability tiers including the new warm/aux/learn-evidence/calibrated ablations |
-| Temporal benchmark | `section_08_temporal_benchmark.py` | `temporal/compare_temporal.py` | L1-L4 plus L2T/L3T temporal feature-teacher comparison and optional vendored SOTA baselines |
-| Temporal ablations | `section_09_temporal_ablations.py` | `temporal/ablations.py` | fixed L4 aggregation/head sweeps plus L2T/L3T feature-teacher ablations |
+| Temporal benchmark | `section_08_temporal_benchmark.py` | `temporal/compare_temporal.py` | L1-L4 plus TabPFN-TS teacher -> tree-student distillation and optional vendored SOTA baselines |
+| Temporal ablations | `section_09_temporal_ablations.py` | `temporal/ablations.py` | fixed L4 aggregation/head sweeps plus TabPFN-TS distill students and black-box baseline |
 | Case studies | `section_10_case_studies.py` | `temporal/case_studies.py` | per-sample top-rule explanations for paper examples |
 
 TabPFN v3 weights are gated.  After accepting the
 `Prior-Labs/tabpfn_3` terms, run
-`python download_tabpfn_ts_weights.py --kind ts` for the temporal L2T/L3T
-rows and `python download_tabpfn_ts_weights.py --kind classifier` for
-tabular TabPFN baseline/distillation rows.
+`python download_tabpfn_ts_weights.py --kind ts` for temporal TabPFN-TS
+distillation / baseline rows.  Run
+`python download_tabpfn_ts_weights.py --kind classifier` for TabPFN
+classifier-head or tabular baseline/distillation rows.
 
 Vendored temporal baselines are tracked as Git submodules under
 `temporal/vendor/*`.  Use `git submodule update --init --recursive` after

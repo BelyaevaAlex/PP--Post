@@ -1,11 +1,11 @@
-"""Smoke-suite for the slim re-implementation track in
-:mod:`temporal.baselines`.
+"""Smoke-suite for the local baseline track in :mod:`temporal.baselines`.
 
 After the migration to the *only-vendored* SOTA strategy, this module
-hosts only the three baselines for which we have no upstream worth
-vendoring: ``lr`` / ``xgb`` / ``transformer``.  The seven SOTA
-baselines (GRU-D, SAnD, mTAN, SeFT, Raindrop, CAMELOT, InterpGN) are
-covered by :mod:`temporal.tests.test_baselines_vendored` and
+hosts local baselines with no upstream worth vendoring plus the
+standalone TabPFN-TS black-box row: ``lr`` / ``xgb`` / ``tabpfn_ts`` /
+``transformer``.  The seven SOTA baselines (GRU-D, SAnD, mTAN, SeFT,
+Raindrop, CAMELOT, InterpGN) are covered by
+:mod:`temporal.tests.test_baselines_vendored` and
 :mod:`temporal.tests.test_baselines_vendored_tf`.
 """
 
@@ -37,8 +37,8 @@ def _tiny_dataset():
     )
 
 
-def test_registry_covers_reimpls_only():
-    expected = {"lr", "xgb", "transformer"}
+def test_registry_covers_local_baselines_only():
+    expected = {"lr", "xgb", "tabpfn_ts", "transformer"}
     assert set(BASELINE_REGISTRY) == expected
     assert set(DEFAULT_BASELINES) == expected
 
@@ -71,6 +71,13 @@ def test_xgb_stats_fits_and_predicts():
     _check_fit_predict("xgb", {"n_windows": 2})
 
 
+def test_tabpfn_ts_baseline_fits_and_predicts():
+    _check_fit_predict(
+        "tabpfn_ts",
+        {"ts_backend": "extratrees", "ts_max_rows": 128, "head": "logreg"},
+    )
+
+
 def test_transformer_fits_and_predicts():
     _check_fit_predict(
         "transformer",
@@ -80,9 +87,10 @@ def test_transformer_fits_and_predicts():
 
 
 if __name__ == "__main__":
-    test_registry_covers_reimpls_only()
+    test_registry_covers_local_baselines_only()
     test_make_baseline_unknown_raises()
     test_lr_stats_fits_and_predicts()
     test_xgb_stats_fits_and_predicts()
+    test_tabpfn_ts_baseline_fits_and_predicts()
     test_transformer_fits_and_predicts()
     print("test_baselines: OK")

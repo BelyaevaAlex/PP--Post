@@ -1,17 +1,17 @@
-"""TabPFN-style temporal feature teacher for PPtheta-Post ablations.
+"""Internal TabPFN-TS representation extractor.
 
-The tabular track already uses TabPFN as a teacher whose signal is
-distilled into tree branches.  For time series we keep the same
-philosophy, but the teacher produces forecasting-derived features rather
-than class probabilities: one-step forecasts, forecast deltas and
-teacher residual/uncertainty summaries per variable.
+The public temporal experiments use TabPFN-TS as a black-box teacher or
+standalone baseline.  This helper builds the forecasting representation
+consumed by that black-box classifier; the exposed interpretable rows
+distill soft labels into XGB / ExtraTrees / CatBoost students trained on
+ordinary L2/L3 temporal features.
 
 The preferred ``tabpfn_ts`` backend uses the installed
 ``tabpfn_time_series.TabPFNTSPipeline`` in LOCAL mode.  It expects the
 TabPFN-TS checkpoint downloaded by ``download_tabpfn_ts_weights.py`` or a
 ``TABPFN_TS_MODEL_PATH`` override.  A local ExtraTrees backend is also
-exposed so CI and smoke tests can exercise the PPtheta-Post integration
-without requiring gated checkpoints or network access.
+exposed so CI and smoke tests can run without gated checkpoints or
+network access.
 """
 
 from __future__ import annotations
@@ -67,7 +67,7 @@ def _safe_observed_values(X_ts: np.ndarray, mask: np.ndarray, v: int) -> np.ndar
 
 @dataclass
 class TabPFNTSFeatureTeacher:
-    """Forecasting feature teacher for temporal PPtheta-Post.
+    """Forecasting representation builder for TabPFN-TS distillation.
 
     Parameters
     ----------

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Paper Section 09: temporal PPtheta-Post ablations.
 
-Runs the fixed-L4 aggregation/head sweep and appends L2T/L3T
-TabPFN-style feature-teacher ablations.
+Runs the fixed-L4 aggregation/head sweep and appends temporal TabPFN-TS
+distillation rows plus the standalone black-box TabPFN-TS baseline.
 """
 
 from __future__ import annotations
@@ -18,7 +18,8 @@ from temporal.ablations import main as run_ablations  # noqa: E402
 
 
 DEFAULT_ARGS = [
-    "--include-ts-feature-teacher",
+    "--include-tabpfn-ts-distill",
+    "--include-tabpfn-ts-baseline",
     "--ts-teacher-backend",
     "tabpfn_ts",
     "--output-dir",

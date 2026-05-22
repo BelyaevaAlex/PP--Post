@@ -1,13 +1,15 @@
 """§6 — External baselines for the PPθ-Post-Temporal comparison.
 
-This module ships the **lightweight re-implementation track** of three
-shallow / canonical baselines that have *no dedicated upstream
-repository* worth vendoring:
+This module ships the local baseline track for shallow / canonical
+models that have *no dedicated upstream repository* worth vendoring,
+plus the standalone TabPFN-TS black-box row:
 
     * :class:`LRStatsBaseline`            — logistic regression on L1
       summary statistics (interpretable shallow baseline).
     * :class:`XGBStatsBaseline`           — XGBoost on L2 multi-window
       statistics (non-interpretable shallow baseline).
+    * :class:`TabPFNTSBaseline`           — black-box TabPFN-TS temporal
+      representation with a classifier head.
     * :class:`TransformerIMTSBaseline`    — vanilla Transformer encoder
       over per-timestep ``(value, mask)`` snapshots — a generic deep
       baseline distinct from any IMTS-specialised SOTA.
@@ -49,6 +51,7 @@ if PARENT_DIR not in sys.path:
     sys.path.insert(0, PARENT_DIR)
 
 from .tabularize import multi_window_flatten, summary_flatten  # noqa: E402
+from .tabpfn_ts_distill import TabPFNTSClassifierTeacher  # noqa: E402
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -243,6 +246,59 @@ class XGBStatsBaseline(BaselineBase):
         return proba
 
 
+@dataclass
+class TabPFNTSBaseline(BaselineBase):
+    """Standalone black-box TabPFN-TS baseline.
+
+    TabPFN-TS is a forecasting model, not a direct classifier.  This
+    baseline therefore evaluates the black-box temporal teacher itself:
+    TabPFN-TS representation features are fed to a classifier head
+    (TabPFN by default), with no PPtheta-Post rule extraction.
+    """
+
+    n_classes: int = 2
+    seed: int = 42
+    ts_backend: str = "tabpfn_ts"
+    ts_max_rows: int = 4096
+    ts_model_path: Optional[str] = None
+    ts_device: str = "cpu"
+    ts_n_estimators: int = 8
+    ts_num_workers: int = 1
+    head: str = "tabpfn"
+    classifier_model_path: Optional[str] = None
+    classifier_device: str = "cpu"
+    classifier_n_estimators: int = 8
+    name: str = "TabPFN-TS"
+
+    def __post_init__(self):
+        self._teacher: Optional[TabPFNTSClassifierTeacher] = None
+
+    def fit(self, X_ts, mask, y, x_val=None):
+        self._teacher = TabPFNTSClassifierTeacher(
+            n_classes=self.n_classes,
+            seed=self.seed,
+            ts_backend=self.ts_backend,
+            ts_max_rows=self.ts_max_rows,
+            ts_model_path=self.ts_model_path,
+            ts_device=self.ts_device,
+            ts_n_estimators=self.ts_n_estimators,
+            ts_num_workers=self.ts_num_workers,
+            head=self.head,
+            classifier_model_path=self.classifier_model_path,
+            classifier_device=self.classifier_device,
+            classifier_n_estimators=self.classifier_n_estimators,
+        ).fit(X_ts, mask, y)
+        backend = self._teacher.ts_backend_used
+        head = self._teacher.head_used_ or self.head
+        self.name = f"TabPFN-TS-{backend}-{head}"
+        return self
+
+    def predict_proba(self, X_ts, mask):
+        if self._teacher is None:
+            raise RuntimeError("TabPFNTSBaseline must be .fit() first")
+        return self._teacher.predict_proba(X_ts, mask)
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # Transformer-IMTS — vanilla Transformer encoder over (value, mask)
 # snapshots.  This is *not* an IMTS-specialised SOTA — it is a generic
@@ -343,9 +399,10 @@ class TransformerIMTSBaseline(BaselineBase):
 # Registry
 # ═════════════════════════════════════════════════════════════════════════
 #
-# Only the three baselines for which we have no dedicated upstream
-# repository worth vendoring live here.  All IMTS-specialised SOTA
-# baselines (GRU-D, SAnD, mTAN, SeFT, Raindrop, CAMELOT, InterpGN) are
+# Only local baselines for which we have no dedicated upstream
+# repository worth vendoring live here, plus TabPFN-TS.  All
+# IMTS-specialised SOTA baselines (GRU-D, SAnD, mTAN, SeFT, Raindrop,
+# CAMELOT, InterpGN) are
 # served from :mod:`temporal.baselines_vendored` (PyTorch) and
 # :mod:`temporal.baselines_vendored_tf` (TensorFlow).
 # ═════════════════════════════════════════════════════════════════════════
@@ -353,6 +410,7 @@ class TransformerIMTSBaseline(BaselineBase):
 BASELINE_REGISTRY = {
     "lr":          LRStatsBaseline,
     "xgb":         XGBStatsBaseline,
+    "tabpfn_ts":   TabPFNTSBaseline,
     "transformer": TransformerIMTSBaseline,
 }
 

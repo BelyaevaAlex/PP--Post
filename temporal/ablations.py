@@ -25,13 +25,13 @@ Output
 * Final aggregated CSV ``output/temporal/ablations_<timestamp>_summary.csv``
   with mean ± std per variant.
 
-Optional feature-teacher track
-------------------------------
-Pass ``--include-ts-feature-teacher`` to add L2T/L3T variants where
-TabPFN-style forecasting/residual features are distilled into the flat
-PPtheta-Post student.  This mirrors the tabular TabPFN-distill recipe:
-the teacher guides the feature space used to grow branches, while the
-RuleNetwork/PPtheta-Post head is trained against the original labels.
+Optional TabPFN-TS distillation track
+-------------------------------------
+Pass ``--include-tabpfn-ts-distill`` to add temporal analogues of the
+tabular TabPFN-distill rule sources: a black-box TabPFN-TS teacher
+produces soft labels, then XGB / ExtraTrees / CatBoost students are
+trained on ordinary L2/L3 temporal features and converted into
+PPtheta-Post branches.
 """
 
 from __future__ import annotations
@@ -60,8 +60,8 @@ from .compare_temporal import (  # noqa: E402
     FoldResult,
     _aggregate,
     _evaluate,
-    run_l2_ts_teacher,
-    run_l3_ts_teacher,
+    run_baseline,
+    run_tabpfn_ts_distill,
 )
 from .datasets import load_temporal_dataset  # noqa: E402
 from .pp_theta_post_temporal import PPThetaPostTemporal  # noqa: E402
@@ -235,21 +235,39 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--epochs", type=int, default=60)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument(
-        "--include-ts-feature-teacher",
+        "--include-tabpfn-ts-distill",
         action="store_true",
-        help="Append L2T/L3T TabPFN-style temporal feature-teacher "
-             "ablation rows alongside the fixed-L4 aggregation sweep.",
+        help="Append TabPFN-TS -> XGB/ET/CB rule-student rows.",
     )
     p.add_argument(
-        "--ts-teacher-levels", nargs="+", default=["L2T", "L3T"],
-        help="Feature-teacher levels to run when "
-             "--include-ts-feature-teacher is set.",
+        "--include-tabpfn-ts-baseline",
+        action="store_true",
+        help="Append standalone black-box TabPFN-TS baseline row.",
+    )
+    p.add_argument(
+        "--tabpfn-ts-distill-levels", nargs="+", default=["L2", "L3"],
+        help="Ordinary temporal feature levels used by distill students.",
+    )
+    p.add_argument(
+        "--tabpfn-ts-distill-students", nargs="+",
+        default=["xgb", "et", "cb"],
+        help="Rule students for TabPFN-TS distillation: xgb et cb.",
+    )
+    p.add_argument(
+        "--tabpfn-ts-teacher-head",
+        choices=["tabpfn", "xgb", "extratrees", "logreg"],
+        default="tabpfn",
+        help="Classifier head used on TabPFN-TS representation to form soft labels.",
+    )
+    p.add_argument(
+        "--tabpfn-classifier-model-path", default=None,
+        help="Path to TabPFN classifier checkpoint for teacher head=tabpfn.",
     )
     p.add_argument(
         "--ts-teacher-backend",
         choices=["auto", "tabpfn_ts", "tabpfn", "extratrees"],
         default="tabpfn_ts",
-        help="Backend for L2T/L3T feature-teacher variants.",
+        help="Backend for the black-box TabPFN-TS representation.",
     )
     p.add_argument(
         "--ts-teacher-max-rows", type=int, default=4096,
@@ -273,11 +291,11 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     p.add_argument(
         "--n-windows", type=int, default=4,
-        help="Number of windows for L2T when feature-teacher rows run.",
+        help="Number of windows for L2 distill students.",
     )
     p.add_argument(
         "--n-intervals", type=int, default=10,
-        help="Number of intervals for L3T when feature-teacher rows run.",
+        help="Number of intervals for L3 distill students.",
     )
     p.add_argument(
         "--output-dir",
@@ -304,12 +322,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     md.write(f"Datasets: {args.datasets} | folds: {args.folds} | "
              f"epochs: {args.epochs}\n")
-    if args.include_ts_feature_teacher:
+    if args.include_tabpfn_ts_distill:
         md.write(
-            f"\nFeature-teacher rows: {args.ts_teacher_levels} | "
+            f"\nTabPFN-TS distill rows: {args.tabpfn_ts_distill_levels} | "
+            f"students: {args.tabpfn_ts_distill_students} | "
             f"backend: {args.ts_teacher_backend} | "
-            f"max_rows: {args.ts_teacher_max_rows}\n"
+            f"head: {args.tabpfn_ts_teacher_head}\n"
         )
+    if args.include_tabpfn_ts_baseline:
+        md.write("\nStandalone baseline: TabPFN-TS black-box classifier\n")
 
     all_per_fold: List[AblationFoldResult] = []
 
@@ -336,43 +357,56 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 var_names=var_names, n_classes=n_classes,
                 seed=args.seed, epochs=args.epochs,
             )
-            if args.include_ts_feature_teacher:
-                teacher_levels = {
-                    str(level).upper() for level in args.ts_teacher_levels
-                }
-                if "L2T" in teacher_levels:
-                    try:
-                        results.update(run_l2_ts_teacher(
-                            X_tr_ts, mask_tr, y_tr,
-                            X_va_ts, mask_va, y_va,
-                            n_classes=n_classes, seed=args.seed,
-                            epochs=args.epochs, n_windows=args.n_windows,
-                            teacher_backend=args.ts_teacher_backend,
-                            teacher_max_rows=args.ts_teacher_max_rows,
-                            teacher_model_path=args.ts_teacher_model_path,
-                            teacher_device=args.ts_teacher_device,
-                            teacher_n_estimators=args.ts_teacher_n_estimators,
-                            teacher_num_workers=args.ts_teacher_workers,
-                        ))
-                    except (RuntimeError, ImportError) as exc:
-                        print(f"    [skipped] L2T feature teacher: {exc}")
-                if "L3T" in teacher_levels:
-                    try:
-                        results.update(run_l3_ts_teacher(
-                            X_tr_ts, mask_tr, y_tr,
-                            X_va_ts, mask_va, y_va,
-                            var_names=var_names, n_classes=n_classes,
-                            seed=args.seed, epochs=args.epochs,
-                            n_intervals=args.n_intervals,
-                            teacher_backend=args.ts_teacher_backend,
-                            teacher_max_rows=args.ts_teacher_max_rows,
-                            teacher_model_path=args.ts_teacher_model_path,
-                            teacher_device=args.ts_teacher_device,
-                            teacher_n_estimators=args.ts_teacher_n_estimators,
-                            teacher_num_workers=args.ts_teacher_workers,
-                        ))
-                    except (RuntimeError, ImportError) as exc:
-                        print(f"    [skipped] L3T feature teacher: {exc}")
+            if args.include_tabpfn_ts_distill:
+                for distill_level in args.tabpfn_ts_distill_levels:
+                    for student in args.tabpfn_ts_distill_students:
+                        try:
+                            results.update(run_tabpfn_ts_distill(
+                                X_tr_ts, mask_tr, y_tr,
+                                X_va_ts, mask_va, y_va,
+                                var_names=var_names, n_classes=n_classes,
+                                seed=args.seed, epochs=args.epochs,
+                                level=distill_level,
+                                student=student,
+                                n_windows=args.n_windows,
+                                n_intervals=args.n_intervals,
+                                teacher_backend=args.ts_teacher_backend,
+                                teacher_max_rows=args.ts_teacher_max_rows,
+                                teacher_model_path=args.ts_teacher_model_path,
+                                teacher_device=args.ts_teacher_device,
+                                teacher_n_estimators=args.ts_teacher_n_estimators,
+                                teacher_num_workers=args.ts_teacher_workers,
+                                teacher_head=args.tabpfn_ts_teacher_head,
+                                classifier_model_path=(
+                                    args.tabpfn_classifier_model_path
+                                ),
+                            ))
+                        except (RuntimeError, ImportError, ValueError) as exc:
+                            print(
+                                "    [skipped] TabPFN-TS distill "
+                                f"{distill_level}/{student}: {exc}"
+                            )
+            if args.include_tabpfn_ts_baseline:
+                try:
+                    results.update(run_baseline(
+                        "tabpfn_ts",
+                        X_tr_ts, mask_tr, y_tr,
+                        X_va_ts, mask_va, y_va,
+                        n_classes=n_classes, seed=args.seed,
+                        epochs=args.epochs,
+                        ts_backend=args.ts_teacher_backend,
+                        ts_max_rows=args.ts_teacher_max_rows,
+                        ts_model_path=args.ts_teacher_model_path,
+                        ts_device=args.ts_teacher_device,
+                        ts_n_estimators=args.ts_teacher_n_estimators,
+                        ts_num_workers=args.ts_teacher_workers,
+                        head=args.tabpfn_ts_teacher_head,
+                        classifier_model_path=args.tabpfn_classifier_model_path,
+                        classifier_device=args.ts_teacher_device,
+                        classifier_n_estimators=args.ts_teacher_n_estimators,
+                    ))
+                except (RuntimeError, ImportError, ValueError) as exc:
+                    print(f"    [skipped] TabPFN-TS baseline: {exc}")
             for variant_name, fold_result in results.items():
                 per_variant.setdefault(variant_name, []).append(fold_result)
                 all_per_fold.append(AblationFoldResult(

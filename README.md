@@ -434,9 +434,7 @@ inference variants from the static pipeline.
 |------|------|----------------------|
 | **L1** | Per-variable summary stats `(mean, std, min, max, first, last, slope, count, frac_obs)` | None — pipeline runs as-is on the flat feature vector |
 | **L2** | Multi-window summary stats + cross-window deltas | None — only feature engineering |
-| **L2T** | L2 plus TabPFN-style temporal feature teacher | Forecasting/residual features are added at training time, then distilled into the same symbolic PPθ-Post student |
 | **L3** | Time-Series-Forest backbone over random intervals × `{mean, std, slope}` | Trees split on interval features; metadata table maps `feature_idx → (var, interval, stat)` |
-| **L3T** | L3 plus TabPFN-style temporal feature teacher | Interval rules get extra teacher features without changing the downstream branch / ProbLog schema |
 | **L4** | Per-timestep latent `z(b, X, t)` + temporal aggregation | `PPThetaPostTemporal` runs condition-aware rule activation on `[N*T, 2V]` snapshots, aggregates over time |
 
 ### 10.2 L3 — temporal ProbLog atoms
@@ -456,16 +454,22 @@ The `feature_meta` table is consumed by
 `export_temporal_problog_program` without any change to `Branch` /
 `Condition`.
 
-### 10.3 L2T / L3T — temporal feature-teacher distillation
+### 10.3 TabPFN-TS Distillation
 
-`temporal.tabpfn_ts_teacher.TabPFNTSFeatureTeacher` mirrors the tabular
-TabPFN-distill recipe in a forecasting setting.  The preferred backend
-uses `tabpfn_time_series.TabPFNTSPipeline` in LOCAL mode with the gated
-`Prior-Labs/tabpfn_3` time-series checkpoint.  It emits per-variable
-forecast, forecast-delta and residual/uncertainty features and is then
-dropped.  The RuleNetwork/PPθ-Post student is trained against the
-original class labels, so branch statistics remain grounded in `(X, y)`
-rather than teacher pseudo-labels.
+Temporal TabPFN is used only as a black-box teacher, not as an
+interpretable feature space.  The teacher builds a TabPFN-TS temporal
+representation and a classifier head produces soft labels.  Then XGB,
+ExtraTrees, or CatBoost students are trained on ordinary L2/L3 temporal
+features, their branches are extracted, and PPθ-Post runs on those
+student branches.
+
+Registered rows follow the form:
+
+| Row family | Meaning |
+|---|---|
+| `L2-TabPFNTS-DistillXGB/ET/CB` | TabPFN-TS teacher → tree student on L2 features → PPθ-Post |
+| `L3-TabPFNTS-DistillXGB/ET/CB` | TabPFN-TS teacher → tree student on L3 interval features → PPθ-Post |
+| `BL_TabPFN-TS-*` | standalone black-box TabPFN-TS representation + classifier head baseline |
 
 Download weights once after accepting the Hugging Face terms:
 
@@ -487,7 +491,9 @@ Example:
 ```bash
 python -m temporal.compare_temporal \
   --datasets p12 pam \
-  --levels L2 L2T L3 L3T \
+  --levels L2 L3 \
+  --include-tabpfn-ts-distill \
+  --baselines tabpfn_ts \
   --ts-teacher-backend tabpfn_ts \
   --ts-teacher-model-path "$TABPFN_TS_MODEL_PATH" \
   --ts-teacher-workers 1
@@ -564,7 +570,8 @@ Registered in `temporal.temporal_inference.DEFAULT_TEMPORAL_VARIANTS`:
   and mimic3-benchmarks (mortality task) at laptop scale.  Real loaders
   drop into the same registry once credentialing is in place.
 - `python -m temporal.compare_temporal --datasets p12 pam mimic3
-  --levels L1 L2 L2T L3 L3T L4 --folds 3 --epochs 80` — **intra-method
+  --levels L1 L2 L3 L4 --include-tabpfn-ts-distill
+  --baselines tabpfn_ts --folds 3 --epochs 80` — **intra-method
   ablation** across PPθ-Post temporal levels.  Markdown summary saved to
   `output/temporal/compare_temporal_<timestamp>.md`.
 - Same driver with `--baselines lr xgb transformer sand mtan gru_d
@@ -572,9 +579,11 @@ Registered in `temporal.temporal_inference.DEFAULT_TEMPORAL_VARIANTS`:
   external baselines to the report.  All SOTA rows run from the
   *authors' original code* (`temporal/vendor/*`) — see §10.7.
 - `python -m temporal.ablations --datasets pam
-  --include-ts-feature-teacher` — fixes the L4 backbone and sweeps over
+  --include-tabpfn-ts-distill --include-tabpfn-ts-baseline` — fixes the
+  L4 backbone and sweeps over
   aggregation modes / hyper-parameters (`top_k_time`, attention modes,
-  k-of-T thresholds), then appends L2T/L3T feature-teacher rows.
+  k-of-T thresholds), then appends TabPFN-TS distill students and the
+  standalone black-box TabPFN-TS baseline.
 - `python -m temporal.case_studies --dataset p12 --level L3 --top-k 5`
   — emits human-readable top-K rules per sample as JSON for the paper /
   supplementary.
@@ -600,11 +609,11 @@ Registered in `temporal.temporal_inference.DEFAULT_TEMPORAL_VARIANTS`:
 ```
 python -m temporal.tests.test_tabularize                # L1 / L2 shapes
 python -m temporal.tests.test_interval_forest           # L3 backbone + meta
-python -m temporal.tests.test_tabpfn_ts_teacher         # L2T / L3T teacher features
+python -m temporal.tests.test_tabpfn_ts_teacher         # TabPFN-TS distill + baseline smoke tests
 python -m temporal.tests.test_temporal_problog          # L3 / L4 ProbLog export
 python -m temporal.tests.test_pp_theta_post_temporal    # L4 fit / predict / aggregations / multi-head attention
 python -m temporal.tests.test_problog_spotcheck         # full-program ProbLog ↔ analytical parity
-python -m temporal.tests.test_baselines                 # 3 reimpl baselines (LR/XGB/Transformer-IMTS)
+python -m temporal.tests.test_baselines                 # local baselines (LR/XGB/TabPFN-TS/Transformer-IMTS)
 python -m temporal.tests.test_baselines_vendored        # 5 PyTorch vendored adapters
 python -m temporal.tests.test_baselines_vendored_tf     # 2 TF vendored adapters (SeFT, CAMELOT)
 ```
@@ -622,13 +631,14 @@ in a single dispatcher `UNIFIED_BASELINE_REGISTRY` exposed by
 on the registry key — no `--vendored` flag, **vendored is the only
 track for SOTA**.
 
-**Re-implementation track** (`temporal/baselines.py`) — three
-baselines that have no upstream worth vendoring:
+**Local baseline track** (`temporal/baselines.py`) — shallow/canonical
+baselines with no upstream worth vendoring, plus TabPFN-TS:
 
 | Key | Module class | Notes |
 |---|---|---|
 | `lr` | `LRStatsBaseline` | Logistic regression on L1 statistics; interpretable shallow baseline |
 | `xgb` | `XGBStatsBaseline` | XGBoost on L2 multi-window statistics; non-interpretable shallow |
+| `tabpfn_ts` | `TabPFNTSBaseline` | standalone black-box TabPFN-TS representation + classifier head |
 | `transformer` | `TransformerIMTSBaseline` | Vanilla Transformer encoder over `(value, mask)` snapshots |
 
 **PyTorch vendored track** (`temporal/baselines_vendored.py`) —
