@@ -1,5 +1,12 @@
 # Formal expressivity of the differentiable posterior layer
 
+For the paper-level theory block, see also
+`THEORY_RULE_EVIDENCE.md`.  That note states the unified
+rule-evidence view shared with NSToolkit and then isolates the
+PPtheta-Post-specific claims: exact ProbLog equivalence, posterior
+log-odds decomposition, soft-to-hard consistency, depth-normalised
+evidence, and noisy-or expressivity limits.
+
 This note states the theoretical capabilities and limitations of the
 ``DifferentiablePosterior`` + noisy-or layer used in ``PPθ-Post`` and
 ``e2e-NoisyOr``, and points to the empirical probes in

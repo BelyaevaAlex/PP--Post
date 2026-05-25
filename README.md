@@ -13,6 +13,11 @@ head then updates these latent activations with observed evidence,
 enabling Bayesian inference, interpretable explanations, and multiple
 aggregation strategies.
 
+The paper-level theory block is summarised in
+`THEORY_RULE_EVIDENCE.md`: exact ProbLog equivalence, posterior
+log-odds decomposition, soft-to-hard consistency, depth-normalised
+evidence, and noisy-or expressivity limits.
+
 **Temporal paper (PPθ-Post-Temporal)**: target **IEEE ICDM 2026**, track **A\*** (main conference research paper). Deadlines: abstract **30 May 2026**; full paper **6 June 2026** — see `../PAPER_LAYOUT.md` and `../cursor_documentation.md` (confirm on the official ICDM 2026 CFP).
 
 ---
