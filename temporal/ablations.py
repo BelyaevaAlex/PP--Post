@@ -59,6 +59,7 @@ from .compare_temporal import (  # noqa: E402
     AggregatedRow,
     FoldResult,
     _aggregate,
+    _cleanup_memory,
     _evaluate,
     run_baseline,
     run_tabpfn_ts_distill,
@@ -123,15 +124,59 @@ class AblationFoldResult:
     fold_result: FoldResult
 
 
+def _log(message: str) -> None:
+    print(f"[temporal_ablations {time.strftime('%Y-%m-%dT%H:%M:%S')}] {message}", flush=True)
+
+
+def _short_metrics(result: FoldResult) -> str:
+    return (
+        f"acc={result.accuracy:.4f} f1w={result.f1_weighted:.4f} "
+        f"mcc={result.mcc:.4f} roc={result.roc_auc:.4f} "
+        f"pr={result.pr_auc:.4f} fit={result.fit_seconds:.1f}s "
+        f"pred={result.predict_seconds:.2f}s"
+    )
+
+
+def _stratified_attention_subset(
+    y: np.ndarray,
+    max_samples: int,
+    seed: int,
+) -> np.ndarray:
+    n = len(y)
+    cap = int(max_samples)
+    if cap <= 0 or n <= cap:
+        return np.arange(n)
+    rng = np.random.default_rng(seed)
+    pieces = []
+    for cls in np.unique(y):
+        cls_idx = np.where(y == cls)[0]
+        take = max(1, int(round(cap * len(cls_idx) / n)))
+        take = min(take, len(cls_idx))
+        pieces.append(rng.choice(cls_idx, size=take, replace=False))
+    idx = np.concatenate(pieces)
+    if len(idx) > cap:
+        idx = rng.choice(idx, size=cap, replace=False)
+    rng.shuffle(idx)
+    return idx
+
+
 def run_l4_ablation_one_fold(
     X_train_ts: np.ndarray, mask_train: np.ndarray, y_train: np.ndarray,
     X_val_ts: np.ndarray, mask_val: np.ndarray, y_val: np.ndarray,
     var_names: Sequence[str], n_classes: int, seed: int, epochs: int,
+    log_prefix: str = "",
+    l4_batch_size: int = 256,
+    attention_max_samples: int = 2048,
 ) -> Dict[str, FoldResult]:
     """Train a single PPThetaPostTemporal and evaluate every ablation
     variant on the same held-out validation set.
     """
+    prefix = f"{log_prefix} " if log_prefix else ""
     out: Dict[str, FoldResult] = {}
+    _log(
+        f"{prefix}backbone fit start train={X_train_ts.shape} "
+        f"val={X_val_ts.shape} epochs={epochs} batch={l4_batch_size}"
+    )
     t0 = time.time()
     tbn = PPThetaPostTemporal(
         var_names=var_names, n_classes=n_classes,
@@ -141,39 +186,69 @@ def run_l4_ablation_one_fold(
         x_val=(X_val_ts, mask_val, y_val),
     )
     fit_secs = time.time() - t0
+    _log(
+        f"{prefix}backbone fit done fit={fit_secs:.1f}s "
+        f"branches={len(tbn.branches)}"
+    )
 
-    z_val = tbn.predict_branch_probs_per_time(X_val_ts, mask_val)
     theta = build_theta_matrix(tbn.branches, n_classes)
+    _log(f"{prefix}theta built shape={theta.shape}; variants={len(ABLATION_VARIANTS)}")
     attention_cache: Dict[str, np.ndarray] = {}
 
-    for variant in ABLATION_VARIANTS:
-        if variant["temporal_mode"] == "attention":
-            attn_mode = variant.get("attention_mode", "shared")
-            if attn_mode not in attention_cache:
-                tbn.fit_attention(
-                    X_train_ts, mask_train, y_train, theta=theta,
-                    mode=attn_mode, epochs=200, lr=0.05,
-                )
-                attention_cache[attn_mode] = tbn.attention.weights()
-            attn_w = attention_cache[attn_mode]
-        else:
-            attn_w = None
+    try:
+        for idx, variant in enumerate(ABLATION_VARIANTS, start=1):
+            variant_name = variant["name"]
+            _log(f"{prefix}variant {idx}/{len(ABLATION_VARIANTS)} {variant_name} start")
+            if variant["temporal_mode"] == "attention":
+                attn_mode = variant.get("attention_mode", "shared")
+                if attn_mode not in attention_cache:
+                    attn_idx = _stratified_attention_subset(
+                        y_train, attention_max_samples, seed + idx,
+                    )
+                    _log(
+                        f"{prefix}attention fit start mode={attn_mode} "
+                        f"samples={len(attn_idx)}/{len(y_train)}"
+                    )
+                    t_attn = time.time()
+                    tbn.fit_attention(
+                        X_train_ts[attn_idx], mask_train[attn_idx], y_train[attn_idx],
+                        theta=theta, mode=attn_mode, epochs=200, lr=0.05,
+                    )
+                    attention_cache[attn_mode] = tbn.attention.weights()
+                    _log(
+                        f"{prefix}attention fit done mode={attn_mode} "
+                        f"elapsed={time.time() - t_attn:.1f}s"
+                    )
+                    del attn_idx
+                    _cleanup_memory()
+                attn_w = attention_cache[attn_mode]
+            else:
+                attn_w = None
 
-        clf = TemporalProbLogClassifier(
-            branches=tbn.branches,
-            n_classes=n_classes,
-            head=variant.get("head", "weighted_mean"),
-            temporal_mode=variant["temporal_mode"],
-            k=variant.get("k"),
-            top_k_time=variant.get("top_k_time"),
-            theta=theta,
-        )
-        t1 = time.time()
-        proba = clf.predict_proba(z_val, attention_weights=attn_w)
-        out[variant["name"]] = _evaluate(
-            y_val, proba, n_classes, fit_secs, time.time() - t1,
-        )
-    return out
+            t1 = time.time()
+            proba = tbn.predict_temporal_proba_batched(
+                X_val_ts,
+                mask_val,
+                theta=theta,
+                n_classes=n_classes,
+                head=variant.get("head", "weighted_mean"),
+                temporal_mode=variant["temporal_mode"],
+                k=variant.get("k"),
+                top_k_time=variant.get("top_k_time"),
+                attention_weights=attn_w,
+                batch_size=l4_batch_size,
+            )
+            out[variant_name] = _evaluate(
+                y_val, proba, n_classes, fit_secs, time.time() - t1,
+            )
+            del proba
+            _cleanup_memory()
+            _log(f"{prefix}variant {variant_name} done {_short_metrics(out[variant_name])}")
+        _log(f"{prefix}ablation fold done rows={len(out)}")
+        return out
+    finally:
+        del attention_cache, theta, tbn
+        _cleanup_memory()
 
 
 def _format_md(rows: Dict[str, AggregatedRow]) -> str:
@@ -234,6 +309,18 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--folds", type=int, default=3)
     p.add_argument("--epochs", type=int, default=60)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--l4-batch-size",
+        type=int,
+        default=int(os.environ.get("TEMPORAL_L4_BATCH_SIZE", "256")),
+        help="Patient batch size for memory-bounded L4 validation inference.",
+    )
+    p.add_argument(
+        "--attention-max-samples",
+        type=int,
+        default=int(os.environ.get("TEMPORAL_ATTENTION_MAX_SAMPLES", "2048")),
+        help="Max train patients used to fit attention weights safely.",
+    )
     p.add_argument(
         "--include-tabpfn-ts-distill",
         action="store_true",
@@ -335,8 +422,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     all_per_fold: List[AblationFoldResult] = []
 
     for ds_name in args.datasets:
-        print(f"\n=== dataset: {ds_name} ===")
+        _log(f"dataset start {ds_name}")
+        print(f"\n=== dataset: {ds_name} ===", flush=True)
         X_ts, mask, y, var_names, dataset_name = load_temporal_dataset(ds_name)
+        _log(
+            f"dataset loaded {dataset_name} X_ts={X_ts.shape} "
+            f"mask={mask.shape} y={y.shape} vars={len(var_names)}"
+        )
         n_classes = int(np.unique(y).size)
         skf = StratifiedKFold(
             n_splits=args.folds, shuffle=True, random_state=args.seed,
@@ -344,7 +436,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         per_variant: Dict[str, List[FoldResult]] = {}
         for fold_idx, (train_idx, val_idx) in enumerate(skf.split(X_ts, y)):
-            print(f"  fold {fold_idx + 1}/{args.folds}")
+            print(f"  fold {fold_idx + 1}/{args.folds}", flush=True)
+            _log(f"{dataset_name} fold {fold_idx + 1}/{args.folds} split start")
             X_tr_ts, mask_tr, y_tr = (
                 X_ts[train_idx], mask[train_idx], y[train_idx]
             )
@@ -356,11 +449,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 X_va_ts, mask_va, y_va,
                 var_names=var_names, n_classes=n_classes,
                 seed=args.seed, epochs=args.epochs,
+                log_prefix=f"{dataset_name} fold {fold_idx + 1}/{args.folds}",
             )
             if args.include_tabpfn_ts_distill:
+                _log(f"{dataset_name} fold {fold_idx + 1}/{args.folds} TabPFN-TS distill block start")
                 for distill_level in args.tabpfn_ts_distill_levels:
                     for student in args.tabpfn_ts_distill_students:
+                        _log(
+                            f"{dataset_name} fold {fold_idx + 1}/{args.folds} "
+                            f"distill {distill_level}/{student} start"
+                        )
                         try:
+                            before = set(results)
                             results.update(run_tabpfn_ts_distill(
                                 X_tr_ts, mask_tr, y_tr,
                                 X_va_ts, mask_va, y_va,
@@ -381,13 +481,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                     args.tabpfn_classifier_model_path
                                 ),
                             ))
+                            new_rows = sorted(set(results) - before)
+                            _log(
+                                f"{dataset_name} fold {fold_idx + 1}/{args.folds} "
+                                f"distill {distill_level}/{student} done rows={new_rows}"
+                            )
                         except (RuntimeError, ImportError, ValueError) as exc:
                             print(
                                 "    [skipped] TabPFN-TS distill "
-                                f"{distill_level}/{student}: {exc}"
+                                f"{distill_level}/{student}: {exc}",
+                                flush=True,
                             )
+                            _log(
+                                f"{dataset_name} fold {fold_idx + 1}/{args.folds} "
+                                f"distill {distill_level}/{student} skipped: {exc}"
+                            )
+                _log(f"{dataset_name} fold {fold_idx + 1}/{args.folds} TabPFN-TS distill block done")
             if args.include_tabpfn_ts_baseline:
+                _log(f"{dataset_name} fold {fold_idx + 1}/{args.folds} TabPFN-TS baseline start")
                 try:
+                    before = set(results)
                     results.update(run_baseline(
                         "tabpfn_ts",
                         X_tr_ts, mask_tr, y_tr,
@@ -405,26 +518,41 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         classifier_device=args.ts_teacher_device,
                         classifier_n_estimators=args.ts_teacher_n_estimators,
                     ))
+                    _log(
+                        f"{dataset_name} fold {fold_idx + 1}/{args.folds} "
+                        f"TabPFN-TS baseline done rows={sorted(set(results) - before)}"
+                    )
                 except (RuntimeError, ImportError, ValueError) as exc:
-                    print(f"    [skipped] TabPFN-TS baseline: {exc}")
+                    print(f"    [skipped] TabPFN-TS baseline: {exc}", flush=True)
+                    _log(
+                        f"{dataset_name} fold {fold_idx + 1}/{args.folds} "
+                        f"TabPFN-TS baseline skipped: {exc}"
+                    )
             for variant_name, fold_result in results.items():
                 per_variant.setdefault(variant_name, []).append(fold_result)
                 all_per_fold.append(AblationFoldResult(
                     fold=fold_idx, variant=f"{dataset_name}__{variant_name}",
                     fold_result=fold_result,
                 ))
+            _write_csv(all_per_fold, csv_path)
+            _log(
+                f"{dataset_name} fold {fold_idx + 1}/{args.folds} "
+                f"recorded rows={len(results)} partial_csv={csv_path}"
+            )
 
         rows = {name: _aggregate(fl) for name, fl in per_variant.items()}
         md.write(f"\n## {dataset_name}\n")
         md.write(_format_md(rows))
         _write_summary_csv(rows, summary_path)
+        _log(f"dataset done {dataset_name} variants={len(rows)} summary_csv={summary_path}")
 
     _write_csv(all_per_fold, csv_path)
     with open(md_path, "w", encoding="utf-8") as f:
         f.write(md.getvalue())
-    print(f"\nMarkdown report: {md_path}")
-    print(f"Per-fold CSV:    {csv_path}")
-    print(f"Summary CSV:     {summary_path}")
+    print(f"\nMarkdown report: {md_path}", flush=True)
+    print(f"Per-fold CSV:    {csv_path}", flush=True)
+    print(f"Summary CSV:     {summary_path}", flush=True)
+    _log(f"all done md={md_path} csv={csv_path} summary={summary_path}")
     return 0
 
 

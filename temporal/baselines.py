@@ -50,6 +50,9 @@ PARENT_DIR = os.path.dirname(THIS_DIR)
 if PARENT_DIR not in sys.path:
     sys.path.insert(0, PARENT_DIR)
 
+from tabular.baselines import TabPFNBaseline as TabularTabPFNBaseline  # noqa: E402
+
+from .interval_forest import IntervalFeatureExtractor  # noqa: E402
 from .tabularize import multi_window_flatten, summary_flatten  # noqa: E402
 from .tabpfn_ts_distill import TabPFNTSClassifierTeacher  # noqa: E402
 
@@ -246,6 +249,126 @@ class XGBStatsBaseline(BaselineBase):
         return proba
 
 
+
+@dataclass
+class TabPFNFeatureBaseline(BaselineBase):
+    """Ordinary TabPFNClassifier on fixed temporal feature tables.
+
+    This is distinct from ``TabPFNTSBaseline``: no forecasting worker is
+    used.  The raw irregular series are first converted to the same L1/L2/L3
+    tabular representations used by PPtheta-Post, then a standard
+    TabPFNClassifier is fitted once per fold.
+    """
+
+    n_classes: int = 2
+    feature_level: str = "l1"
+    n_windows: int = 4
+    n_intervals: int = 10
+    seed: int = 42
+    device: Optional[str] = None
+    model_path: Optional[str] = None
+    n_estimators: int = 8
+    auto_scale_n_estimators: bool = False
+    ignore_pretraining_limits: bool = True
+    show_progress_bar: bool = False
+    name: str = "TabPFN-L1-stats"
+
+    def __post_init__(self):
+        self._baseline: Optional[TabularTabPFNBaseline] = None
+        self._extractor: Optional[IntervalFeatureExtractor] = None
+        level = self.feature_level.lower()
+        labels = {
+            "l1": "TabPFN-L1-stats",
+            "stats": "TabPFN-L1-stats",
+            "summary": "TabPFN-L1-stats",
+            "l2": "TabPFN-L2-window",
+            "windows": "TabPFN-L2-window",
+            "window": "TabPFN-L2-window",
+            "l3": "TabPFN-L3-intervals",
+            "intervals": "TabPFN-L3-intervals",
+            "interval": "TabPFN-L3-intervals",
+        }
+        if level not in labels:
+            raise ValueError(
+                f"unknown TabPFN temporal feature level {self.feature_level!r}; "
+                "choose l1 / l2 / l3"
+            )
+        self.name = labels[level]
+
+    def _features(self, X_ts, mask, *, fit: bool) -> np.ndarray:
+        level = self.feature_level.lower()
+        if level in ("l1", "stats", "summary"):
+            return summary_flatten(X_ts, mask)
+        if level in ("l2", "windows", "window"):
+            return multi_window_flatten(
+                X_ts, mask, n_windows=self.n_windows,
+            )
+        if fit or self._extractor is None:
+            var_names = [f"var_{i}" for i in range(X_ts.shape[2])]
+            self._extractor = IntervalFeatureExtractor(
+                var_names=var_names,
+                T=X_ts.shape[1],
+                n_intervals=self.n_intervals,
+                seed=self.seed,
+            )
+        return self._extractor.transform(X_ts, mask)
+
+    def fit(self, X_ts, mask, y, x_val=None):
+        X = self._features(X_ts, mask, fit=True)
+        print(
+            f"    [TabPFNFeature] {self.name} fit X={X.shape} "
+            f"n_estimators={self.n_estimators} "
+            f"auto_scale={self.auto_scale_n_estimators}",
+            flush=True,
+        )
+        kwargs = dict(
+            n_estimators=self.n_estimators,
+            auto_scale_n_estimators=self.auto_scale_n_estimators,
+            ignore_pretraining_limits=self.ignore_pretraining_limits,
+            show_progress_bar=self.show_progress_bar,
+        )
+        if self.device is not None:
+            kwargs["device"] = self.device
+        if self.model_path is not None:
+            kwargs["model_path"] = self.model_path
+        self._baseline = TabularTabPFNBaseline(**kwargs).fit(
+            X, y, n_classes=self.n_classes, seed=self.seed,
+        )
+        return self
+
+    def predict_proba(self, X_ts, mask):
+        if self._baseline is None:
+            raise RuntimeError("TabPFNFeatureBaseline.fit must be called first")
+        X = self._features(X_ts, mask, fit=False)
+        print(f"    [TabPFNFeature] {self.name} predict X={X.shape}", flush=True)
+        proba = self._baseline.predict_proba(X)
+        if proba.shape[1] < self.n_classes:
+            full = np.zeros((proba.shape[0], self.n_classes))
+            classes = getattr(self._baseline._fitted.model, "classes_", None)
+            if classes is None:
+                full[:, :proba.shape[1]] = proba
+            else:
+                for i, c in enumerate(classes):
+                    full[:, int(c)] = proba[:, i]
+            return full
+        return proba
+
+
+@dataclass
+class TabPFNL1Baseline(TabPFNFeatureBaseline):
+    feature_level: str = "l1"
+
+
+@dataclass
+class TabPFNL2Baseline(TabPFNFeatureBaseline):
+    feature_level: str = "l2"
+
+
+@dataclass
+class TabPFNL3Baseline(TabPFNFeatureBaseline):
+    feature_level: str = "l3"
+
+
 @dataclass
 class TabPFNTSBaseline(BaselineBase):
     """Standalone black-box TabPFN-TS baseline.
@@ -410,6 +533,9 @@ class TransformerIMTSBaseline(BaselineBase):
 BASELINE_REGISTRY = {
     "lr":          LRStatsBaseline,
     "xgb":         XGBStatsBaseline,
+    "tabpfn_l1":   TabPFNL1Baseline,
+    "tabpfn_l2":   TabPFNL2Baseline,
+    "tabpfn_l3":   TabPFNL3Baseline,
     "tabpfn_ts":   TabPFNTSBaseline,
     "transformer": TransformerIMTSBaseline,
 }

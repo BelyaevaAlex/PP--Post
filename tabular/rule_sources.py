@@ -44,6 +44,26 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+
+def _default_tabpfn_device() -> str:
+    requested = os.environ.get("TABPFN_DEVICE", "auto").strip().lower()
+    if requested and requested != "auto":
+        return requested
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda"
+    except Exception:
+        pass
+    return "cpu"
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
 from branch_schema import Branch, Condition
 
 
@@ -653,6 +673,270 @@ class CatBoostRuleSource(RuleSource):
         }
 
 
+
+# --------------------------------------------------------------------------- #
+# EBM terms — turn additive glass-box bins into explicit Branch objects
+# --------------------------------------------------------------------------- #
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return int(default)
+    try:
+        return int(raw)
+    except ValueError:
+        return int(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return float(default)
+    try:
+        return float(raw)
+    except ValueError:
+        return float(default)
+
+
+def _sigmoid01(x: float) -> float:
+    return float(1.0 / (1.0 + np.exp(-np.clip(float(x), -50.0, 50.0))))
+
+
+def _softmax(values: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    values = values - np.max(values)
+    ex = np.exp(np.clip(values, -50.0, 50.0))
+    s = ex.sum()
+    return ex / s if s > 0 else np.ones_like(ex) / max(len(ex), 1)
+
+
+def _ebm_score_to_class_proportions(score: Any, n_classes: int) -> List[float]:
+    arr = np.asarray(score, dtype=np.float64).reshape(-1)
+    if n_classes == 2 and arr.size == 1:
+        p1 = _sigmoid01(float(arr[0]))
+        return [1.0 - p1, p1]
+    if arr.size >= n_classes:
+        probs = _softmax(arr[:n_classes])
+        return probs.tolist()
+    out = np.ones(n_classes, dtype=np.float64) / max(n_classes, 1)
+    if n_classes == 2 and arr.size:
+        p1 = _sigmoid01(float(arr[0]))
+        out = np.array([1.0 - p1, p1], dtype=np.float64)
+    return out.tolist()
+
+
+def _ebm_cuts_for_feature(clf: Any, feature_idx: int, level: int) -> Optional[np.ndarray]:
+    bins = getattr(clf, "bins_", None)
+    if bins is None or feature_idx >= len(bins):
+        return None
+    feature_bins = bins[feature_idx]
+    if not feature_bins:
+        return None
+    raw = feature_bins[min(int(level), len(feature_bins) - 1)]
+    # Continuous features expose numeric cut arrays.  Categorical bins are
+    # dictionaries in interpret; mortality preprocessing is numeric, so skip
+    # unsupported categorical encodings instead of inventing opaque rules.
+    if isinstance(raw, dict):
+        return None
+    try:
+        cuts = np.asarray(raw, dtype=np.float64).reshape(-1)
+    except Exception:  # noqa: BLE001
+        return None
+    cuts = cuts[np.isfinite(cuts)]
+    return np.sort(cuts)
+
+
+def _ebm_conditions_for_bin(
+    feature_idx: int,
+    cuts: np.ndarray,
+    bin_idx: int,
+    n_bins: int,
+    node_base: int,
+) -> Optional[List[Condition]]:
+    # interpret reserves bin 0 for missing and the final bin for unknown/other.
+    if bin_idx <= 0 or bin_idx >= n_bins - 1:
+        return None
+    cuts = np.asarray(cuts, dtype=np.float64).reshape(-1)
+    non_special_bins = n_bins - 2
+    if non_special_bins <= 0:
+        return None
+    conditions: List[Condition] = []
+    if cuts.size == 0:
+        return conditions
+    if bin_idx == 1:
+        conditions.append(Condition(
+            feature_idx=feature_idx,
+            threshold=float(cuts[0]),
+            direction="le",
+            node_id=node_base,
+        ))
+    elif bin_idx == non_special_bins:
+        conditions.append(Condition(
+            feature_idx=feature_idx,
+            threshold=float(cuts[-1]),
+            direction="gt",
+            node_id=node_base,
+        ))
+    else:
+        lo = float(cuts[bin_idx - 2])
+        hi = float(cuts[bin_idx - 1])
+        conditions.append(Condition(
+            feature_idx=feature_idx,
+            threshold=lo,
+            direction="gt",
+            node_id=node_base,
+        ))
+        conditions.append(Condition(
+            feature_idx=feature_idx,
+            threshold=hi,
+            direction="le",
+            node_id=node_base + 1,
+        ))
+    return conditions
+
+
+class EBMTermsRuleSource(RuleSource):
+    """Expose EBM additive terms as explicit PPtheta-Post rule branches.
+
+    Each non-special EBM bin (main effect) or interaction cell becomes one
+    :class:`Branch` with interval conditions.  The EBM model remains the native
+    predictor for ``source_native``; PPtheta-Post variants operate only over the
+    extracted symbolic bins/cells.
+    """
+
+    name = "ebm_terms"
+
+    def _fit(self, X, y, *, n_features, n_classes, seed):
+        try:
+            from interpret.glassbox import ExplainableBoostingClassifier
+        except ImportError as e:
+            raise ImportError(
+                "interpret is not installed. Install with `pip install interpret` "
+                "or activate the per-baseline venv."
+            ) from e
+
+        params = dict(
+            max_bins=self.kwargs.get("max_bins", _env_int("EBM_MAX_BINS", 256)),
+            max_interaction_bins=self.kwargs.get(
+                "max_interaction_bins", _env_int("EBM_MAX_INTERACTION_BINS", 32)
+            ),
+            interactions=self.kwargs.get("interactions", _env_int("EBM_INTERACTIONS", 10)),
+            outer_bags=self.kwargs.get("outer_bags", _env_int("EBM_OUTER_BAGS", 8)),
+            random_state=seed,
+        )
+        clf = ExplainableBoostingClassifier(**params).fit(X, y)
+
+        min_support = float(self.kwargs.get(
+            "min_support", _env_float("EBM_TERMS_MIN_SUPPORT", 1.0)
+        ))
+        max_branches = int(self.kwargs.get(
+            "max_branches", _env_int("EBM_TERMS_MAX_BRANCHES", 2048)
+        ))
+
+        candidates: List[Tuple[float, int, Tuple[int, ...], List[Condition], List[float], float]] = []
+        term_features = list(getattr(clf, "term_features_", []))
+        term_scores = list(getattr(clf, "term_scores_", []))
+        bin_weights = list(getattr(clf, "bin_weights_", []))
+
+        for term_idx, features_raw in enumerate(term_features):
+            features = tuple(int(f) for f in features_raw)
+            if not features or term_idx >= len(term_scores):
+                continue
+            scores = np.asarray(term_scores[term_idx])
+            bin_shape = tuple(int(v) for v in scores.shape[:len(features)])
+            if len(bin_shape) != len(features) or any(v <= 2 for v in bin_shape):
+                continue
+            weights = None
+            if term_idx < len(bin_weights):
+                try:
+                    weights = np.asarray(bin_weights[term_idx], dtype=np.float64)
+                except Exception:  # noqa: BLE001
+                    weights = None
+            level = max(0, len(features) - 1)
+            cuts_by_feature = [
+                _ebm_cuts_for_feature(clf, feat, level) for feat in features
+            ]
+            if any(cuts is None for cuts in cuts_by_feature):
+                continue
+
+            for bin_indices in np.ndindex(*bin_shape):
+                all_conditions: List[Condition] = []
+                skip = False
+                for dim, (feat, bin_idx, n_bins, cuts) in enumerate(
+                    zip(features, bin_indices, bin_shape, cuts_by_feature)
+                ):
+                    conds = _ebm_conditions_for_bin(
+                        feat,
+                        cuts,
+                        int(bin_idx),
+                        int(n_bins),
+                        node_base=term_idx * 1_000_000 + dim * 10_000 + int(bin_idx) * 10,
+                    )
+                    if conds is None:
+                        skip = True
+                        break
+                    all_conditions.extend(conds)
+                if skip or not all_conditions:
+                    continue
+
+                support = 0.0
+                if weights is not None and weights.shape[:len(features)] == bin_shape:
+                    try:
+                        support = float(weights[bin_indices])
+                    except Exception:  # noqa: BLE001
+                        support = 0.0
+                if support < min_support:
+                    continue
+
+                cell_score = scores[bin_indices]
+                cp = _ebm_score_to_class_proportions(cell_score, n_classes)
+                score_mag = float(np.linalg.norm(np.asarray(cell_score, dtype=np.float64).reshape(-1)))
+                priority = score_mag * np.log1p(max(support, 0.0))
+                candidates.append((priority, term_idx, tuple(int(i) for i in bin_indices), all_conditions, cp, support))
+
+        candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
+        total_candidates = len(candidates)
+        if max_branches > 0:
+            candidates = candidates[:max_branches]
+        candidates.sort(key=lambda item: (item[1], item[2]))
+
+        branches_by_term: Dict[int, List[Branch]] = {}
+        offset = 0
+        for _, term_idx, bin_indices, conditions, cp, support in candidates:
+            tree_id = int(term_idx)
+            last = conditions[-1]
+            branches_by_term.setdefault(tree_id, []).append(Branch(
+                branch_id=f"b{offset}",
+                tree_id=tree_id,
+                parent_node_id=offset,
+                conditions=list(conditions),
+                class_proportions=cp,
+                split_feature_idx=last.feature_idx,
+                split_threshold=last.threshold,
+                split_node_id=last.node_id,
+            ))
+            offset += 1
+
+        branches_per_tree = [branches_by_term.get(i, []) for i in range(len(term_features))]
+        Xr, yr = self._refine_X(X, y, seed)
+        n_refined = sum(
+            _empirical_class_proportions(br, Xr, yr, n_classes)
+            for br in branches_per_tree
+            if br
+        )
+        return branches_per_tree, clf, {
+            "estimator": "ExplainableBoostingClassifier",
+            "n_ebm_terms": len(term_features),
+            "n_candidate_bins": int(total_candidates),
+            "n_branches_selected": int(offset),
+            "n_branches_refined": int(n_refined),
+            "max_branches": int(max_branches),
+            "min_support": float(min_support),
+            "refinement_mode": "vectorized_eval",
+            "refinement_samples": int(Xr.shape[0]),
+        }
+
 # --------------------------------------------------------------------------- #
 # FIGS — walk imodels.tree.figs.Node recursive structure
 # --------------------------------------------------------------------------- #
@@ -845,7 +1129,8 @@ class TabPFNDistillRuleSource(RuleSource):
 
     def _fit(self, X, y, *, n_features, n_classes, seed):
         tabpfn_kwargs = dict(self.kwargs.get("tabpfn_kwargs", {}))
-        if str(tabpfn_kwargs.get("device", "cpu")).lower() == "cpu":
+        device = tabpfn_kwargs.get("device") or _default_tabpfn_device()
+        if str(device).lower() == "cpu":
             os.environ.setdefault("TABPFN_EXCLUDE_DEVICES", "mps")
         try:
             from tabpfn import TabPFNClassifier
@@ -864,7 +1149,7 @@ class TabPFNDistillRuleSource(RuleSource):
             )
 
         # 1. Teacher: TabPFN.
-        tabpfn_kwargs.setdefault("device", "cpu")
+        tabpfn_kwargs.setdefault("device", device)
         tabpfn_kwargs.setdefault("random_state", seed)
         model_path = (
             tabpfn_kwargs.get("model_path")
@@ -874,6 +1159,10 @@ class TabPFNDistillRuleSource(RuleSource):
         if model_path:
             tabpfn_kwargs["model_path"] = model_path
         tabpfn_kwargs.setdefault("show_progress_bar", False)
+        tabpfn_kwargs.setdefault(
+            "ignore_pretraining_limits",
+            _env_bool("TABPFN_IGNORE_PRETRAINING_LIMITS", False),
+        )
         import inspect
         sig = inspect.signature(TabPFNClassifier.__init__)
         teacher = TabPFNClassifier(
@@ -888,11 +1177,28 @@ class TabPFNDistillRuleSource(RuleSource):
             full[:, :p_soft.shape[1]] = p_soft
             p_soft = full
 
-        y_distill = p_soft.argmax(axis=1).astype(np.int64)
-        sample_weight = p_soft.max(axis=1).astype(np.float64)
-        # Stabilise: drop near-zero weights so the student doesn't see
-        # essentially-uniform rows that would shrink branches to noise.
-        sample_weight = np.clip(sample_weight, 1.0 / max(n_classes, 2), None)
+        distill_target = str(self.kwargs.get("distill_target", "hard_conf")).lower()
+        if distill_target in {"soft_true", "soft", "mixed"}:
+            true_weight = float(self.kwargs.get("true_label_weight", 0.50))
+            true_weight = float(np.clip(true_weight, 0.0, 1.0))
+            y_onehot = np.zeros((len(y), n_classes), dtype=np.float64)
+            y_onehot[np.arange(len(y)), np.asarray(y, dtype=int)] = 1.0
+            p_mix = true_weight * y_onehot + (1.0 - true_weight) * p_soft[:, :n_classes]
+            p_mix = np.clip(p_mix, 1e-6, 1.0)
+            classes = np.arange(n_classes, dtype=np.int64)
+            X_student = np.repeat(X, n_classes, axis=0)
+            y_student = np.tile(classes, len(y)).astype(np.int64)
+            sample_weight = p_mix.reshape(-1).astype(np.float64)
+            sample_weight = sample_weight / np.maximum(sample_weight.mean(), 1e-12)
+            tabpfn_confidence_mean = float(p_soft.max(axis=1).mean())
+        else:
+            y_student = p_soft.argmax(axis=1).astype(np.int64)
+            sample_weight = p_soft.max(axis=1).astype(np.float64)
+            # Stabilise: drop near-zero weights so the student doesn't see
+            # essentially-uniform rows that would shrink branches to noise.
+            sample_weight = np.clip(sample_weight, 1.0 / max(n_classes, 2), None)
+            X_student = X
+            tabpfn_confidence_mean = float(sample_weight.mean())
 
         # 2. Student: route to one of the existing rule sources, but with
         #    distilled labels.  We do not call the registered _fit
@@ -900,8 +1206,12 @@ class TabPFNDistillRuleSource(RuleSource):
         #    y; instead we replicate the minimal training path inline.
         student_extra: Dict[str, Any] = {
             "tabpfn_n": int(X.shape[0]),
-            "tabpfn_confidence_mean": float(sample_weight.mean()),
+            "tabpfn_confidence_mean": tabpfn_confidence_mean,
             "distill_student": student_key,
+            "distill_target": distill_target,
+            # Kept in-memory only: delta variants use the real TabPFN teacher
+            # probabilities for auditable posterior distillation.
+            "tabpfn_teacher_model": teacher,
         }
 
         if student_key in ("extratrees", "et"):
@@ -914,7 +1224,7 @@ class TabPFNDistillRuleSource(RuleSource):
                 n_jobs=self.kwargs.get("n_jobs", 1),
             )
             student = ExtraTreesClassifier(**params).fit(
-                X, y_distill, sample_weight=sample_weight,
+                X_student, y_student, sample_weight=sample_weight,
             )
             branches_per_tree = extract_branches_from_sklearn_ensemble(student)
             # ExtraTrees' sklearn-tree path already encodes empirical cp
@@ -944,7 +1254,7 @@ class TabPFNDistillRuleSource(RuleSource):
             else:
                 params.setdefault("objective", "binary:logistic")
             student = xgb.XGBClassifier(**params).fit(
-                X, y_distill, sample_weight=sample_weight,
+                X_student, y_student, sample_weight=sample_weight,
             )
             booster = student.get_booster()
             dump = booster.get_dump(dump_format="json")
@@ -988,7 +1298,7 @@ class TabPFNDistillRuleSource(RuleSource):
             thread_count=self.kwargs.get("n_jobs", 1),
         )
         student = CatBoostClassifier(**params).fit(
-            X, y_distill, sample_weight=sample_weight,
+            X_student, y_student, sample_weight=sample_weight,
         )
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "model.json")
@@ -1107,6 +1417,16 @@ class _TabPFNDistillXGB(TabPFNDistillRuleSource):
         super().__init__(**kwargs)
 
 
+class _TabPFNDistillXGBSoft(TabPFNDistillRuleSource):
+    name = "tabpfn_distill_xgb_soft"
+
+    def __init__(self, **kwargs: Any) -> None:
+        kwargs.setdefault("student", "xgb")
+        kwargs.setdefault("distill_target", "soft_true")
+        kwargs.setdefault("true_label_weight", 0.50)
+        super().__init__(**kwargs)
+
+
 class _TabPFNDistillET(TabPFNDistillRuleSource):
     name = "tabpfn_distill_et"
 
@@ -1123,13 +1443,372 @@ class _TabPFNDistillCB(TabPFNDistillRuleSource):
         super().__init__(**kwargs)
 
 
+
+
+def _extract_ebm_term_branches(
+    clf: Any,
+    X_refine: np.ndarray,
+    y_refine: np.ndarray,
+    n_classes: int,
+    *,
+    max_branches: int,
+    min_support: float,
+) -> Tuple[List[List[Branch]], Dict[str, Any]]:
+    """Extract EBM bins/cells as Branch objects and refine cp on real labels."""
+    candidates: List[Tuple[float, int, Tuple[int, ...], List[Condition], List[float], float]] = []
+    term_features = list(getattr(clf, "term_features_", []))
+    term_scores = list(getattr(clf, "term_scores_", []))
+    bin_weights = list(getattr(clf, "bin_weights_", []))
+
+    for term_idx, features_raw in enumerate(term_features):
+        features = tuple(int(f) for f in features_raw)
+        if not features or term_idx >= len(term_scores):
+            continue
+        scores = np.asarray(term_scores[term_idx])
+        bin_shape = tuple(int(v) for v in scores.shape[:len(features)])
+        if len(bin_shape) != len(features) or any(v <= 2 for v in bin_shape):
+            continue
+        weights = None
+        if term_idx < len(bin_weights):
+            try:
+                weights = np.asarray(bin_weights[term_idx], dtype=np.float64)
+            except Exception:  # noqa: BLE001
+                weights = None
+        level = max(0, len(features) - 1)
+        cuts_by_feature = [_ebm_cuts_for_feature(clf, feat, level) for feat in features]
+        if any(cuts is None for cuts in cuts_by_feature):
+            continue
+        for bin_indices in np.ndindex(*bin_shape):
+            all_conditions: List[Condition] = []
+            skip = False
+            for dim, (feat, bin_idx, n_bins, cuts) in enumerate(zip(features, bin_indices, bin_shape, cuts_by_feature)):
+                conds = _ebm_conditions_for_bin(
+                    feat, cuts, int(bin_idx), int(n_bins),
+                    node_base=term_idx * 1_000_000 + dim * 10_000 + int(bin_idx) * 10,
+                )
+                if conds is None:
+                    skip = True
+                    break
+                all_conditions.extend(conds)
+            if skip or not all_conditions:
+                continue
+            support = 0.0
+            if weights is not None and weights.shape[:len(features)] == bin_shape:
+                try:
+                    support = float(weights[bin_indices])
+                except Exception:  # noqa: BLE001
+                    support = 0.0
+            if support < min_support:
+                continue
+            cell_score = scores[bin_indices]
+            cp = _ebm_score_to_class_proportions(cell_score, n_classes)
+            score_mag = float(np.linalg.norm(np.asarray(cell_score, dtype=np.float64).reshape(-1)))
+            priority = score_mag * np.log1p(max(support, 0.0))
+            candidates.append((priority, term_idx, tuple(int(i) for i in bin_indices), all_conditions, cp, support))
+
+    candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
+    total_candidates = len(candidates)
+    if max_branches > 0:
+        candidates = candidates[:max_branches]
+    candidates.sort(key=lambda item: (item[1], item[2]))
+
+    branches_by_term: Dict[int, List[Branch]] = {}
+    offset = 0
+    for _, term_idx, _bin_indices, conditions, cp, _support in candidates:
+        last = conditions[-1]
+        branches_by_term.setdefault(int(term_idx), []).append(Branch(
+            branch_id=f"b{offset}",
+            tree_id=int(term_idx),
+            parent_node_id=offset,
+            conditions=list(conditions),
+            class_proportions=cp,
+            split_feature_idx=last.feature_idx,
+            split_threshold=last.threshold,
+            split_node_id=last.node_id,
+        ))
+        offset += 1
+
+    branches_per_tree = [branches_by_term.get(i, []) for i in range(len(term_features))]
+    n_refined = sum(
+        _empirical_class_proportions(br, X_refine, y_refine, n_classes)
+        for br in branches_per_tree
+        if br
+    )
+    return branches_per_tree, {
+        "n_ebm_terms": len(term_features),
+        "n_candidate_bins": int(total_candidates),
+        "n_branches_selected": int(offset),
+        "n_branches_refined": int(n_refined),
+        "max_branches": int(max_branches),
+        "min_support": float(min_support),
+        "refinement_mode": "vectorized_eval",
+        "refinement_samples": int(X_refine.shape[0]),
+    }
+
+
+class TabPFNDistillEBMTermsRuleSource(RuleSource):
+    """Distil TabPFN into an EBM/GA2M-style student, then expose EBM terms.
+
+    TabPFN is used only on the training fold. The deployed rule source is an
+    ExplainableBoostingClassifier whose additive bins and interaction cells are
+    converted into PPtheta-Post evidence branches and re-refined on true labels.
+    """
+
+    name = "tabpfn_distill_ebm_terms"
+
+    def _fit(self, X, y, *, n_features, n_classes, seed):
+        try:
+            from tabpfn import TabPFNClassifier
+        except ImportError as e:
+            raise ImportError("tabpfn is not installed for TabPFN-to-EBM distillation") from e
+        try:
+            from interpret.glassbox import ExplainableBoostingClassifier
+        except ImportError as e:
+            raise ImportError("interpret is not installed for EBM distillation") from e
+
+        tabpfn_kwargs = dict(self.kwargs.get("tabpfn_kwargs", {}))
+        tabpfn_kwargs.setdefault("device", _default_tabpfn_device())
+        tabpfn_kwargs.setdefault("random_state", seed)
+        tabpfn_kwargs.setdefault("show_progress_bar", False)
+        tabpfn_kwargs.setdefault("ignore_pretraining_limits", _env_bool("TABPFN_IGNORE_PRETRAINING_LIMITS", False))
+        model_path = os.environ.get("TABPFN_CLASSIFIER_MODEL_PATH") or os.environ.get("TABPFN_MODEL_PATH")
+        if model_path:
+            tabpfn_kwargs["model_path"] = model_path
+        import inspect
+        sig = inspect.signature(TabPFNClassifier.__init__)
+        teacher = TabPFNClassifier(**{k: v for k, v in tabpfn_kwargs.items() if k in sig.parameters})
+        teacher.fit(X, y)
+        p_soft = np.asarray(teacher.predict_proba(X), dtype=np.float64)
+        if p_soft.ndim == 1:
+            p_soft = np.column_stack([1.0 - p_soft, p_soft])
+        if p_soft.shape[1] < n_classes:
+            full = np.zeros((p_soft.shape[0], n_classes), dtype=np.float64)
+            full[:, :p_soft.shape[1]] = p_soft
+            p_soft = full
+        true_weight = float(np.clip(self.kwargs.get("true_label_weight", 0.35), 0.0, 1.0))
+        y_onehot = np.zeros((len(y), n_classes), dtype=np.float64)
+        y_onehot[np.arange(len(y)), np.asarray(y, dtype=int)] = 1.0
+        p_mix = true_weight * y_onehot + (1.0 - true_weight) * p_soft[:, :n_classes]
+        y_student = p_mix.argmax(axis=1).astype(np.int64)
+        sample_weight = np.clip(p_mix.max(axis=1), 1.0 / max(n_classes, 2), None)
+        sample_weight = sample_weight / np.maximum(sample_weight.mean(), 1e-12)
+
+        params = dict(
+            max_bins=self.kwargs.get("max_bins", _env_int("EBM_MAX_BINS", 256)),
+            max_interaction_bins=self.kwargs.get("max_interaction_bins", _env_int("EBM_MAX_INTERACTION_BINS", 32)),
+            interactions=self.kwargs.get("interactions", _env_int("TABPFN_EBM_INTERACTIONS", _env_int("EBM_INTERACTIONS", 10))),
+            outer_bags=self.kwargs.get("outer_bags", _env_int("EBM_OUTER_BAGS", 8)),
+            random_state=seed,
+        )
+        clf = ExplainableBoostingClassifier(**params).fit(X, y_student, sample_weight=sample_weight)
+        min_support = float(self.kwargs.get("min_support", _env_float("EBM_TERMS_MIN_SUPPORT", 1.0)))
+        max_branches = int(self.kwargs.get("max_branches", _env_int("EBM_TERMS_MAX_BRANCHES", 2048)))
+        Xr, yr = self._refine_X(X, y, seed)
+        branches_per_tree, meta = _extract_ebm_term_branches(
+            clf, Xr, yr, n_classes, max_branches=max_branches, min_support=min_support,
+        )
+        meta.update({
+            "estimator": "TabPFNDistilledExplainableBoostingClassifier",
+            "tabpfn_confidence_mean": float(p_soft.max(axis=1).mean()),
+            "true_label_weight": float(true_weight),
+            "tabpfn_teacher_model": teacher,
+        })
+        return branches_per_tree, clf, meta
+
+class _ClinicalMonotoneNative:
+    """Simple native scorer for clinical monotone rule families."""
+
+    def __init__(self, branches: List[Branch], class_prior: np.ndarray, n_classes: int) -> None:
+        self.branches = branches
+        self.class_prior = np.asarray(class_prior, dtype=np.float64)
+        self.n_classes = int(n_classes)
+        self.classes_ = np.arange(self.n_classes)
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        X = np.asarray(X, dtype=np.float64)
+        prior = np.clip(self.class_prior, 1e-9, 1.0)
+        prior = prior / np.maximum(prior.sum(), 1e-12)
+        out = np.tile(prior, (X.shape[0], 1))
+        if not self.branches:
+            return out
+        votes = np.zeros_like(out)
+        counts = np.zeros(X.shape[0], dtype=np.float64)
+        for branch in self.branches:
+            mask = np.ones(X.shape[0], dtype=bool)
+            for cond in branch.conditions:
+                col = X[:, int(cond.feature_idx)]
+                if cond.direction == "le":
+                    mask &= col <= float(cond.threshold)
+                else:
+                    mask &= col > float(cond.threshold)
+                if not mask.any():
+                    break
+            if not mask.any():
+                continue
+            cp = np.asarray(branch.class_proportions, dtype=np.float64)
+            if cp.size != self.n_classes:
+                cp = prior
+            cp = np.clip(cp, 1e-9, 1.0)
+            cp = cp / np.maximum(cp.sum(), 1e-12)
+            votes[mask] += cp
+            counts[mask] += 1.0
+        active = counts > 0
+        out[active] = votes[active] / counts[active, None]
+        return out
+
+
+class ClinicalMonotoneRuleSource(RuleSource):
+    """Build compact monotone clinical threshold families from the train fold.
+
+    The source is intentionally model-light: it chooses features whose values
+    have a stable univariate direction with the mortality label, creates
+    risk-direction threshold rules, and adds a small set of same-direction
+    two-feature conjunctions. Class proportions are then re-estimated from
+    the original labels, so downstream PPtheta-Post sees explicit clinical
+    evidence objects without a black-box teacher at inference time.
+    """
+
+    name = "clinical_monotone"
+
+    def _fit(self, X, y, *, n_features, n_classes, seed):
+        X = np.asarray(X, dtype=np.float64)
+        y = np.asarray(y, dtype=np.int64)
+        if X.size == 0:
+            prior = np.ones(n_classes, dtype=np.float64) / max(n_classes, 1)
+            return [[]], _ClinicalMonotoneNative([], prior, n_classes), {
+                "n_candidate_rules": 0,
+                "n_branches_refined": 0,
+            }
+
+        max_features = int(self.kwargs.get(
+            "max_features", _env_int("CLINICAL_MONOTONE_MAX_FEATURES", 32)
+        ))
+        max_interactions = int(self.kwargs.get(
+            "max_interactions", _env_int("CLINICAL_MONOTONE_MAX_INTERACTIONS", 32)
+        ))
+        max_branches = int(self.kwargs.get(
+            "max_branches", _env_int("CLINICAL_MONOTONE_MAX_BRANCHES", 256)
+        ))
+        min_support = float(self.kwargs.get(
+            "min_support", _env_float("CLINICAL_MONOTONE_MIN_SUPPORT", 0.01)
+        ))
+        quantiles = self.kwargs.get("quantiles", None)
+        if quantiles is None:
+            quantiles = (0.50, 0.75, 0.90)
+
+        if n_classes == 2:
+            y_bin = (y == 1).astype(np.float64)
+        else:
+            y_bin = (y == int(np.bincount(y, minlength=n_classes).argmax())).astype(np.float64)
+        y_center = y_bin - y_bin.mean()
+        scores: List[Tuple[float, int, int]] = []
+        for j in range(n_features):
+            col = X[:, j]
+            finite = np.isfinite(col)
+            if finite.sum() < 5:
+                continue
+            xj = col[finite]
+            if np.nanstd(xj) < 1e-9:
+                continue
+            yc = y_center[finite]
+            corr = float(np.nan_to_num(np.corrcoef(xj, yc)[0, 1], nan=0.0))
+            if abs(corr) <= 1e-8:
+                continue
+            scores.append((abs(corr), j, 1 if corr >= 0 else -1))
+        scores.sort(reverse=True)
+        selected = scores[:max(1, min(max_features, len(scores)))]
+
+        branches: List[Branch] = []
+        tree_id = 0
+        candidate_count = 0
+
+        def add_branch(conditions: List[Condition]) -> None:
+            nonlocal candidate_count, tree_id
+            candidate_count += 1
+            if max_branches > 0 and len(branches) >= max_branches:
+                return
+            mask = np.ones(X.shape[0], dtype=bool)
+            for cond in conditions:
+                col = X[:, int(cond.feature_idx)]
+                if cond.direction == "le":
+                    mask &= col <= float(cond.threshold)
+                else:
+                    mask &= col > float(cond.threshold)
+            support = float(mask.mean())
+            if support < min_support or not mask.any():
+                return
+            counts = np.bincount(y[mask], minlength=n_classes).astype(np.float64) + 1e-3
+            cp = counts / counts.sum()
+            last = conditions[-1]
+            branches.append(Branch(
+                branch_id=f"b{len(branches)}",
+                tree_id=tree_id,
+                parent_node_id=len(branches),
+                conditions=list(conditions),
+                class_proportions=cp.tolist(),
+                split_feature_idx=last.feature_idx,
+                split_threshold=last.threshold,
+                split_node_id=last.node_id,
+            ))
+            tree_id += 1
+
+        for _, feat, sign in selected:
+            qs = quantiles if sign >= 0 else tuple(1.0 - float(q) for q in quantiles)
+            for q in qs:
+                thr = float(np.nanquantile(X[:, feat], q))
+                direction = "gt" if sign >= 0 else "le"
+                add_branch([Condition(feat, thr, direction, node_id=len(branches))])
+
+        pairs = []
+        for a_idx, (_, fa, sa) in enumerate(selected):
+            for _, fb, sb in selected[a_idx + 1:]:
+                if len(pairs) >= max_interactions:
+                    break
+                pairs.append((fa, sa, fb, sb))
+            if len(pairs) >= max_interactions:
+                break
+        for fa, sa, fb, sb in pairs:
+            qa = 0.75 if sa >= 0 else 0.25
+            qb = 0.75 if sb >= 0 else 0.25
+            ta = float(np.nanquantile(X[:, fa], qa))
+            tb = float(np.nanquantile(X[:, fb], qb))
+            add_branch([
+                Condition(fa, ta, "gt" if sa >= 0 else "le", node_id=len(branches) * 10),
+                Condition(fb, tb, "gt" if sb >= 0 else "le", node_id=len(branches) * 10 + 1),
+            ])
+
+        branches_per_tree = [[b] for b in branches]
+        Xr, yr = self._refine_X(X, y, seed)
+        n_refined = sum(
+            _empirical_class_proportions(br, Xr, yr, n_classes)
+            for br in branches_per_tree
+        )
+        prior = np.bincount(y, minlength=n_classes).astype(np.float64) + 1e-3
+        prior = prior / prior.sum()
+        native = _ClinicalMonotoneNative(branches, prior, n_classes)
+        return branches_per_tree, native, {
+            "n_candidate_rules": int(candidate_count),
+            "n_selected_features": int(len(selected)),
+            "n_selected_interactions": int(len(pairs)),
+            "n_branches_refined": int(n_refined),
+            "max_branches": int(max_branches),
+            "min_support": float(min_support),
+            "refinement_mode": "vectorized_eval",
+            "refinement_samples": int(Xr.shape[0]),
+        }
+
+
 RULE_SOURCE_REGISTRY: Dict[str, type] = {
     "extratrees":         ExtraTreesRuleSource,
     "xgb":                XGBoostRuleSource,
     "catboost":           CatBoostRuleSource,
     "figs":               FIGSRuleSource,
     "rulefit":            RuleFitRuleSource,
+    "ebm_terms":          EBMTermsRuleSource,
+    "clinical_monotone":  ClinicalMonotoneRuleSource,
+    "tabpfn_distill_ebm_terms": TabPFNDistillEBMTermsRuleSource,
     "tabpfn_distill_xgb": _TabPFNDistillXGB,
+    "tabpfn_distill_xgb_soft": _TabPFNDistillXGBSoft,
     "tabpfn_distill_et":  _TabPFNDistillET,
     "tabpfn_distill_cb":  _TabPFNDistillCB,
 }
@@ -1141,7 +1820,11 @@ RULE_SOURCE_LABELS: Dict[str, str] = {
     "catboost":           "CatBoost",
     "figs":               "FIGS",
     "rulefit":            "RuleFit",
+    "ebm_terms":          "EBM-Terms",
+    "clinical_monotone":  "Clinical-Monotone",
+    "tabpfn_distill_ebm_terms": "TabPFN→EBM-Terms",
     "tabpfn_distill_xgb": "TabPFN→XGB",
+    "tabpfn_distill_xgb_soft": "TabPFN→XGB-Soft",
     "tabpfn_distill_et":  "TabPFN→ExtraTrees",
     "tabpfn_distill_cb":  "TabPFN→CatBoost",
 }

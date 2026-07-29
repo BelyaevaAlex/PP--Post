@@ -42,7 +42,7 @@ from compare_datasets import main as run_compare_datasets  # noqa: E402
 
 DEFAULT_ARGS = [
     "--datasets", "sklearn:wine", "sklearn:breast_cancer", "sklearn:digits",
-    "--rule-sources", "extratrees",
+    "--rule-sources", "extratrees,ebm_terms",
     "--variants", "all",
     "--folds", "3",
     "--output-dir", str(ROOT / "output" / "paper" / "03_tabular_ablations"),

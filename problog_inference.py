@@ -951,15 +951,39 @@ class ProbLogClassifier:
             if z_for_explain.ndim == 1:
                 z_for_explain = z_for_explain[np.newaxis, :]
 
+        theta_matrix = build_theta_matrix(self.branches, self.n_classes, min_theta=self.min_theta)
+        uniform = np.ones(self.n_classes, dtype=np.float64) / self.n_classes
+        raw_prior = theta_matrix.mean(axis=0) if len(self.branches) else uniform
+        prior_sum = float(raw_prior.sum())
+        prior = raw_prior / prior_sum if np.isfinite(prior_sum) and prior_sum > 0 else uniform
+
+        def subset_proba(z_row: np.ndarray, indices: np.ndarray) -> List[float]:
+            if indices.size == 0:
+                return prior.tolist()
+            z_sub = np.clip(z_row[indices], 0.0, None)
+            denom = float(z_sub.sum())
+            if not np.isfinite(denom) or denom <= 0:
+                return prior.tolist()
+            scores = (z_sub[:, None] * theta_matrix[indices]).sum(axis=0) / denom
+            total = float(scores.sum())
+            if np.isfinite(total) and total > 0:
+                return (scores / total).tolist()
+            return prior.tolist()
+
         explanations = []
+        all_indices = np.arange(len(self.branches), dtype=np.int64)
         for i in range(len(X)):
             pred_class = int(predictions[i])
+            z_row = np.asarray(z_for_explain[i], dtype=np.float64)
+            support = z_row[:, None] * theta_matrix
+            ranked = np.argsort(-support[:, pred_class]) if len(self.branches) else np.array([], dtype=np.int64)
             branch_support = []
-            for br_idx, branch in enumerate(self.branches):
+            for br_idx in ranked:
+                branch = self.branches[int(br_idx)]
                 theta = _class_proportions_to_theta(branch)
                 if theta and pred_class < len(theta):
-                    pz_val = float(z_for_explain[i, br_idx])
-                    support_score = theta[pred_class] * pz_val
+                    pz_val = float(z_row[int(br_idx)])
+                    support_score = float(theta[pred_class] * pz_val)
                     branch_support.append({
                         'branch_id': branch.branch_id,
                         'tree_id': branch.tree_id,
@@ -971,11 +995,48 @@ class ProbLogClassifier:
                             for c in branch.conditions
                         ],
                     })
-            branch_support.sort(key=lambda x: x['support_score'], reverse=True)
+            opposing_support = []
+            if self.n_classes > 1 and len(self.branches):
+                opp_scores = support.copy()
+                opp_scores[:, pred_class] = -np.inf
+                opp_class = np.argmax(opp_scores, axis=1)
+                opp_ranked = np.argsort(-opp_scores[np.arange(len(self.branches)), opp_class])
+                for br_idx in opp_ranked[:top_k_branches]:
+                    branch = self.branches[int(br_idx)]
+                    cls = int(opp_class[int(br_idx)])
+                    theta = _class_proportions_to_theta(branch)
+                    if theta and cls < len(theta):
+                        opposing_support.append({
+                            'branch_id': branch.branch_id,
+                            'tree_id': branch.tree_id,
+                            'opposing_class': cls,
+                            'theta_k': theta[cls],
+                            'p_z_posterior': float(z_row[int(br_idx)]),
+                            'support_score': float(theta[cls] * z_row[int(br_idx)]),
+                            'conditions': [
+                                f"f{c.feature_idx} {c.direction} {c.threshold:.4f}"
+                                for c in branch.conditions
+                            ],
+                        })
+            top_only = {}
+            without_top = {}
+            for k in sorted({1, 3, 5, int(top_k_branches)}):
+                if k <= 0:
+                    continue
+                top_idx = np.asarray(ranked[: min(k, len(ranked))], dtype=np.int64)
+                keep = np.ones(len(self.branches), dtype=bool)
+                keep[top_idx] = False
+                top_only[str(k)] = subset_proba(z_row, top_idx)
+                without_top[str(k)] = subset_proba(z_row, all_indices[keep])
             explanations.append({
                 'predicted_class': pred_class,
                 'class_probabilities': proba[i].tolist(),
                 'top_branches': branch_support[:top_k_branches],
+                'opposing_branches': opposing_support,
+                'total_support_mass': float(support[:, pred_class].sum()) if len(self.branches) else 0.0,
+                'total_support_mass_by_class': support.sum(axis=0).tolist() if len(self.branches) else [0.0] * self.n_classes,
+                'proba_top_rules_only': top_only,
+                'proba_without_top_rules': without_top,
             })
 
         return predictions, explanations
@@ -1020,7 +1081,9 @@ class ProbLogClassifier:
             )
             all_probs[i] = _run_problog_inference(program, self.n_classes, i)
 
-        return all_probs
+        row_sums = all_probs.sum(axis=1, keepdims=True)
+        row_sums = np.where(row_sums > 0, row_sums, 1.0)
+        return all_probs / row_sums
 
 
 # ═════════════════════════════════════════════════════════════

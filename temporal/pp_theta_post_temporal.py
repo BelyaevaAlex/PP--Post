@@ -44,7 +44,7 @@ Notes
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from typing import Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -106,7 +106,7 @@ def temporal_aggregate(
     """
     if mode not in VALID_AGGREGATIONS:
         raise ValueError(f"unknown temporal aggregation mode {mode!r}")
-    arr = np.asarray(z_per_time, dtype=np.float64)
+    arr = np.asarray(z_per_time, dtype=np.float32)
     if arr.ndim == 2:
         arr = arr[np.newaxis, ...]   # [1, T, B]
         squeeze = True
@@ -457,6 +457,89 @@ class PPThetaPostTemporal:
         bp = self.rule_network.predict_branch_proba(snapshots)
         bp = bp.detach().cpu().numpy() if isinstance(bp, torch.Tensor) else bp
         return _unflatten_per_timestep(bp, N, T)
+
+    def iter_branch_probs_per_time(
+        self,
+        X_ts: np.ndarray,
+        mask: np.ndarray,
+        *,
+        batch_size: int = 256,
+    ) -> Iterator[Tuple[int, int, np.ndarray]]:
+        """Yield ``[batch, T, B]`` branch-probability tensors.
+
+        Full ICU mortality folds can have tens of thousands of validation
+        stays and thousands of branches.  Materialising the complete
+        ``[N, T, B]`` tensor is therefore the dominant memory spike in L4.
+        This iterator keeps the public full-tensor API available while
+        giving production runners a bounded-memory path.
+        """
+        self._check_fitted()
+        if X_ts.ndim != 3 or mask.shape != X_ts.shape:
+            raise ValueError("X_ts and mask must both have shape [N, T, V]")
+        N, T, _ = X_ts.shape
+        if T != self.T:
+            raise ValueError(
+                f"input time dimension {T} != fitted T={self.T}"
+            )
+        batch = max(1, int(batch_size))
+        for start in range(0, N, batch):
+            end = min(start + batch, N)
+            snapshots = _flatten_per_timestep(X_ts[start:end], mask[start:end])
+            bp = self.rule_network.predict_branch_proba(snapshots)
+            bp = bp.detach().cpu().numpy() if isinstance(bp, torch.Tensor) else bp
+            z_batch = _unflatten_per_timestep(bp, end - start, T).astype(
+                np.float32, copy=False,
+            )
+            del snapshots, bp
+            yield start, end, z_batch
+
+    def predict_temporal_proba_batched(
+        self,
+        X_ts: np.ndarray,
+        mask: np.ndarray,
+        *,
+        theta: np.ndarray,
+        n_classes: int,
+        head: str = "weighted_mean",
+        temporal_mode: AggregationMode = "mean",
+        k: Optional[float] = None,
+        top_k_time: Optional[float] = None,
+        attention_weights: Optional[np.ndarray] = None,
+        batch_size: int = 256,
+    ) -> np.ndarray:
+        """Predict L4 probabilities without holding full ``z_per_time``.
+
+        The output is numerically equivalent to calling
+        :class:`TemporalProbLogClassifier` on the full tensor for the
+        non-attention variants used by ``temporal.compare_temporal``.
+        """
+        from problog_inference import aggregate_noisy_or, aggregate_weighted_mean
+
+        if head not in ("noisy_or", "weighted_mean"):
+            raise ValueError(f"head must be 'noisy_or' or 'weighted_mean', got {head!r}")
+        proba_chunks: List[np.ndarray] = []
+        for _, _, z_batch in self.iter_branch_probs_per_time(
+            X_ts, mask, batch_size=batch_size,
+        ):
+            z = temporal_aggregate(
+                z_batch,
+                mode=temporal_mode,
+                k=k,
+                attention_weights=attention_weights,
+                top_k_time=top_k_time,
+            )
+            if z.ndim == 1:
+                z = z[np.newaxis, :]
+            if head == "noisy_or":
+                proba = aggregate_noisy_or(z, theta)
+            else:
+                proba = aggregate_weighted_mean(z, theta)
+            proba_chunks.append(np.asarray(proba, dtype=np.float32))
+            del z_batch, z, proba
+        if not proba_chunks:
+            return np.empty((0, n_classes), dtype=np.float32)
+        out = np.vstack(proba_chunks)
+        return out.astype(np.float64, copy=False)
 
     def predict_branch_probs(
         self,

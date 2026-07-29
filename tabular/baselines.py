@@ -49,6 +49,26 @@ from typing import Any, Dict
 import numpy as np
 
 
+def _default_tabpfn_device() -> str:
+    requested = os.environ.get("TABPFN_DEVICE", "auto").strip().lower()
+    if requested and requested != "auto":
+        return requested
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda"
+    except Exception:
+        pass
+    return "cpu"
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 # --------------------------------------------------------------------------- #
 # Contract
 # --------------------------------------------------------------------------- #
@@ -203,7 +223,8 @@ class TabPFNBaseline(TabularBaselineBase):
     name = "tabpfn"
 
     def _fit(self, X, y, *, n_classes, seed):
-        if str(self.kwargs.get("device", "cpu")).lower() == "cpu":
+        device = self.kwargs.get("device") or _default_tabpfn_device()
+        if str(device).lower() == "cpu":
             os.environ.setdefault("TABPFN_EXCLUDE_DEVICES", "mps")
         try:
             from tabpfn import TabPFNClassifier
@@ -225,7 +246,7 @@ class TabPFNBaseline(TabularBaselineBase):
             )
 
         params = dict(
-            device=self.kwargs.get("device", "cpu"),
+            device=device,
             random_state=seed,
         )
         model_path = (
@@ -236,11 +257,15 @@ class TabPFNBaseline(TabularBaselineBase):
         if model_path:
             params["model_path"] = model_path
         params["show_progress_bar"] = self.kwargs.get("show_progress_bar", False)
-        # TabPFN v2 takes (n_estimators, ignore_pretraining_limits) extras.
+        # TabPFN v2/v3 takes estimator-budget extras.
         if "n_estimators" in self.kwargs:
             params["n_estimators"] = self.kwargs["n_estimators"]
-        if "ignore_pretraining_limits" in self.kwargs:
-            params["ignore_pretraining_limits"] = self.kwargs["ignore_pretraining_limits"]
+        if "auto_scale_n_estimators" in self.kwargs:
+            params["auto_scale_n_estimators"] = self.kwargs["auto_scale_n_estimators"]
+        params["ignore_pretraining_limits"] = self.kwargs.get(
+            "ignore_pretraining_limits",
+            _env_bool("TABPFN_IGNORE_PRETRAINING_LIMITS", False),
+        )
 
         # Different TabPFN versions accept different kwargs; filter safely.
         import inspect

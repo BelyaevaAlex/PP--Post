@@ -43,6 +43,8 @@ The script writes a Markdown summary table to
 from __future__ import annotations
 
 import argparse
+import csv
+import gc
 import os
 import sys
 import time
@@ -66,6 +68,7 @@ if PARENT_DIR not in sys.path:
 from rule_network_model import RuleNetworkModel  # noqa: E402
 from problog_inference import (  # noqa: E402
     ProbLogClassifier,
+    aggregate_noisy_or,
     aggregate_weighted_mean,
     build_theta_matrix,
 )
@@ -89,17 +92,17 @@ from .baselines_vendored_tf import (  # noqa: E402
     VENDORED_TF_REGISTRY,
     make_vendored_tf,
 )
-from .pp_theta_post_temporal import PPThetaPostTemporal  # noqa: E402
+from .pp_theta_post_temporal import (  # noqa: E402
+    PPThetaPostTemporal,
+    temporal_aggregate,
+)
 from .tabpfn_ts_distill import (  # noqa: E402
     TabPFNTSClassifierTeacher,
     fit_distilled_rule_student,
     student_label,
 )
 from .tabularize import multi_window_flatten, summary_flatten  # noqa: E402
-from .temporal_inference import (  # noqa: E402
-    DEFAULT_TEMPORAL_VARIANTS,
-    TemporalProbLogClassifier,
-)
+from .temporal_inference import DEFAULT_TEMPORAL_VARIANTS  # noqa: E402
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -161,6 +164,114 @@ def _evaluate(
     )
 
 
+def _cleanup_memory() -> None:
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception:
+        pass
+    tf_mod = sys.modules.get("tensorflow")
+    if tf_mod is not None:
+        try:
+            tf_mod.keras.backend.clear_session()
+        except Exception:
+            pass
+
+
+def _rss_mb() -> float:
+    try:
+        with open("/proc/self/status", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return float(line.split()[1]) / 1024.0
+    except OSError:
+        return float("nan")
+    return float("nan")
+
+
+def _log_mem(label: str) -> None:
+    rss = _rss_mb()
+    if np.isfinite(rss):
+        print(f"    [mem] {label}: rss={rss:.1f} MB", flush=True)
+
+
+def _append_fold_rows(
+    csv_path: str,
+    dataset_name: str,
+    fold: int,
+    results: Dict[str, FoldResult],
+) -> None:
+    fields = [
+        "dataset", "fold", "variant", "accuracy", "f1_weighted",
+        "mcc", "roc_auc", "pr_auc", "fit_seconds", "predict_seconds",
+    ]
+    exists = os.path.exists(csv_path)
+    with open(csv_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        if not exists:
+            writer.writeheader()
+        for variant, result in results.items():
+            writer.writerow({
+                "dataset": dataset_name,
+                "fold": fold,
+                "variant": variant,
+                "accuracy": result.accuracy,
+                "f1_weighted": result.f1_weighted,
+                "mcc": result.mcc,
+                "roc_auc": result.roc_auc,
+                "pr_auc": result.pr_auc,
+                "fit_seconds": result.fit_seconds,
+                "predict_seconds": result.predict_seconds,
+            })
+
+
+def _append_summary_rows(
+    csv_path: str,
+    dataset_name: str,
+    rows: Dict[str, "AggregatedRow"],
+) -> None:
+    fields = [
+        "dataset", "variant",
+        "accuracy_mean", "accuracy_std",
+        "f1_weighted_mean", "f1_weighted_std",
+        "mcc_mean", "mcc_std",
+        "roc_auc_mean", "roc_auc_std",
+        "pr_auc_mean", "pr_auc_std",
+        "fit_seconds_mean", "fit_seconds_std",
+        "predict_seconds_mean", "predict_seconds_std",
+    ]
+    exists = os.path.exists(csv_path)
+    with open(csv_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        if not exists:
+            writer.writeheader()
+        for variant, agg in rows.items():
+            m = agg.metric_means
+            s = agg.metric_stds
+            writer.writerow({
+                "dataset": dataset_name,
+                "variant": variant,
+                "accuracy_mean": m["accuracy"],
+                "accuracy_std": s["accuracy"],
+                "f1_weighted_mean": m["f1_weighted"],
+                "f1_weighted_std": s["f1_weighted"],
+                "mcc_mean": m["mcc"],
+                "mcc_std": s["mcc"],
+                "roc_auc_mean": m["roc_auc"],
+                "roc_auc_std": s["roc_auc"],
+                "pr_auc_mean": m["pr_auc"],
+                "pr_auc_std": s["pr_auc"],
+                "fit_seconds_mean": m["fit_seconds"],
+                "fit_seconds_std": s["fit_seconds"],
+                "predict_seconds_mean": m["predict_seconds"],
+                "predict_seconds_std": s["predict_seconds"],
+            })
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # Per-level pipeline runners
 # ─────────────────────────────────────────────────────────────────────────
@@ -173,10 +284,24 @@ def _train_rule_network_static(
     seed: int,
     epochs: int,
     n_classes: int,
+    rule_n_estimators: Optional[int] = None,
+    rule_max_leaf_nodes: Optional[int] = None,
 ) -> RuleNetworkModel:
     log2_d = int(np.floor(np.log2(max(X_train.shape[1], 2))))
-    n_est = max(2, n_classes + log2_d)
-    max_leaves = 2 ** (log2_d + 4)
+    n_est = (
+        int(rule_n_estimators)
+        if rule_n_estimators is not None
+        else max(2, n_classes + log2_d)
+    )
+    max_leaves = (
+        int(rule_max_leaf_nodes)
+        if rule_max_leaf_nodes is not None
+        else 2 ** (log2_d + 4)
+    )
+    if n_est < 1:
+        raise ValueError("--rule-n-estimators must be >= 1")
+    if max_leaves < 2:
+        raise ValueError("--rule-max-leaf-nodes must be >= 2")
     forest = ExtraTreesClassifier(
         n_estimators=n_est,
         max_leaf_nodes=max_leaves,
@@ -206,6 +331,8 @@ def _run_static_levels_on_features(
     n_classes: int,
     seed: int,
     epochs: int,
+    rule_n_estimators: Optional[int] = None,
+    rule_max_leaf_nodes: Optional[int] = None,
 ) -> Dict[str, FoldResult]:
     """Train RuleNetwork on a flat feature matrix and report results for
     the standard PPθ-Post inference variants used in this comparison.
@@ -214,6 +341,8 @@ def _run_static_levels_on_features(
     t0 = time.time()
     model = _train_rule_network_static(
         X_train, y_train, X_val, y_val, seed, epochs, n_classes,
+        rule_n_estimators=rule_n_estimators,
+        rule_max_leaf_nodes=rule_max_leaf_nodes,
     )
     fit_secs = time.time() - t0
 
@@ -253,11 +382,15 @@ def run_l1(
     X_train_ts: np.ndarray, mask_train: np.ndarray, y_train: np.ndarray,
     X_val_ts: np.ndarray, mask_val: np.ndarray, y_val: np.ndarray,
     n_classes: int, seed: int, epochs: int,
+    rule_n_estimators: Optional[int] = None,
+    rule_max_leaf_nodes: Optional[int] = None,
 ) -> Dict[str, FoldResult]:
     X_train = summary_flatten(X_train_ts, mask_train)
     X_val = summary_flatten(X_val_ts, mask_val)
     return _run_static_levels_on_features(
         "L1", X_train, y_train, X_val, y_val, n_classes, seed, epochs,
+        rule_n_estimators=rule_n_estimators,
+        rule_max_leaf_nodes=rule_max_leaf_nodes,
     )
 
 
@@ -265,11 +398,15 @@ def run_l2(
     X_train_ts: np.ndarray, mask_train: np.ndarray, y_train: np.ndarray,
     X_val_ts: np.ndarray, mask_val: np.ndarray, y_val: np.ndarray,
     n_classes: int, seed: int, epochs: int, n_windows: int,
+    rule_n_estimators: Optional[int] = None,
+    rule_max_leaf_nodes: Optional[int] = None,
 ) -> Dict[str, FoldResult]:
     X_train = multi_window_flatten(X_train_ts, mask_train, n_windows=n_windows)
     X_val = multi_window_flatten(X_val_ts, mask_val, n_windows=n_windows)
     return _run_static_levels_on_features(
         "L2", X_train, y_train, X_val, y_val, n_classes, seed, epochs,
+        rule_n_estimators=rule_n_estimators,
+        rule_max_leaf_nodes=rule_max_leaf_nodes,
     )
 
 
@@ -278,6 +415,8 @@ def run_l3(
     X_val_ts: np.ndarray, mask_val: np.ndarray, y_val: np.ndarray,
     var_names: Sequence[str], n_classes: int, seed: int, epochs: int,
     n_intervals: int,
+    rule_n_estimators: Optional[int] = None,
+    rule_max_leaf_nodes: Optional[int] = None,
 ) -> Dict[str, FoldResult]:
     extractor = IntervalFeatureExtractor(
         var_names=var_names,
@@ -289,6 +428,8 @@ def run_l3(
     X_val = extractor.transform(X_val_ts, mask_val)
     return _run_static_levels_on_features(
         "L3", X_train, y_train, X_val, y_val, n_classes, seed, epochs,
+        rule_n_estimators=rule_n_estimators,
+        rule_max_leaf_nodes=rule_max_leaf_nodes,
     )
 
 
@@ -398,6 +539,46 @@ def _temporal_student_features(
     raise ValueError("TabPFN-TS distillation supports student levels L2 and L3")
 
 
+def _fit_tabpfn_ts_soft_labels(
+    X_train_ts: np.ndarray,
+    mask_train: np.ndarray,
+    y_train: np.ndarray,
+    *,
+    n_classes: int,
+    seed: int,
+    teacher_backend: str = "tabpfn_ts",
+    teacher_max_rows: int = 4096,
+    teacher_model_path: Optional[str] = None,
+    teacher_device: str = "cpu",
+    teacher_n_estimators: int = 8,
+    teacher_num_workers: int = 1,
+    teacher_head: str = "tabpfn",
+    classifier_model_path: Optional[str] = None,
+) -> np.ndarray:
+    teacher = None
+    try:
+        teacher = TabPFNTSClassifierTeacher(
+            n_classes=n_classes,
+            seed=seed,
+            ts_backend=teacher_backend,
+            ts_max_rows=teacher_max_rows,
+            ts_model_path=teacher_model_path,
+            ts_device=teacher_device,
+            ts_n_estimators=teacher_n_estimators,
+            ts_num_workers=teacher_num_workers,
+            head=teacher_head,
+            classifier_model_path=classifier_model_path,
+            classifier_device=teacher_device,
+            classifier_n_estimators=teacher_n_estimators,
+        ).fit(X_train_ts, mask_train, y_train)
+        return teacher.predict_proba(X_train_ts, mask_train).astype(
+            np.float32, copy=False,
+        )
+    finally:
+        del teacher
+        _cleanup_memory()
+
+
 def run_tabpfn_ts_distill(
     X_train_ts: np.ndarray, mask_train: np.ndarray, y_train: np.ndarray,
     X_val_ts: np.ndarray, mask_val: np.ndarray, y_val: np.ndarray,
@@ -411,6 +592,8 @@ def run_tabpfn_ts_distill(
     teacher_num_workers: int = 1,
     teacher_head: str = "tabpfn",
     classifier_model_path: Optional[str] = None,
+    p_soft_train: Optional[np.ndarray] = None,
+    student_features: Optional[Tuple[np.ndarray, np.ndarray]] = None,
 ) -> Dict[str, FoldResult]:
     """Temporal analogue of tabular TabPFN-distill.
 
@@ -418,32 +601,38 @@ def run_tabpfn_ts_distill(
     series.  The rule student is trained on ordinary L2/L3 temporal
     features, then converted into PPtheta-Post branches.
     """
-    X_train, X_val = _temporal_student_features(
-        level,
-        X_train_ts,
-        mask_train,
-        X_val_ts,
-        mask_val,
-        var_names=var_names,
-        seed=seed,
-        n_windows=n_windows,
-        n_intervals=n_intervals,
-    )
-    teacher = TabPFNTSClassifierTeacher(
-        n_classes=n_classes,
-        seed=seed,
-        ts_backend=teacher_backend,
-        ts_max_rows=teacher_max_rows,
-        ts_model_path=teacher_model_path,
-        ts_device=teacher_device,
-        ts_n_estimators=teacher_n_estimators,
-        ts_num_workers=teacher_num_workers,
-        head=teacher_head,
-        classifier_model_path=classifier_model_path,
-        classifier_device=teacher_device,
-        classifier_n_estimators=teacher_n_estimators,
-    ).fit(X_train_ts, mask_train, y_train)
-    p_soft = teacher.predict_proba(X_train_ts, mask_train)
+    if student_features is None:
+        X_train, X_val = _temporal_student_features(
+            level,
+            X_train_ts,
+            mask_train,
+            X_val_ts,
+            mask_val,
+            var_names=var_names,
+            seed=seed,
+            n_windows=n_windows,
+            n_intervals=n_intervals,
+        )
+    else:
+        X_train, X_val = student_features
+
+    p_soft = p_soft_train
+    if p_soft is None:
+        p_soft = _fit_tabpfn_ts_soft_labels(
+            X_train_ts, mask_train, y_train,
+            n_classes=n_classes,
+            seed=seed,
+            teacher_backend=teacher_backend,
+            teacher_max_rows=teacher_max_rows,
+            teacher_model_path=teacher_model_path,
+            teacher_device=teacher_device,
+            teacher_n_estimators=teacher_n_estimators,
+            teacher_num_workers=teacher_num_workers,
+            teacher_head=teacher_head,
+            classifier_model_path=classifier_model_path,
+        )
+    p_soft = np.asarray(p_soft, dtype=np.float32)
+
     fitted_student = fit_distilled_rule_student(
         X_train,
         y_train,
@@ -456,18 +645,24 @@ def run_tabpfn_ts_distill(
         f"{level.upper()}-TabPFNTS-"
         f"Distill{student_label(student)}"
     )
-    return _run_static_levels_on_branches(
-        label,
-        fitted_student.branches_per_tree,
-        X_train,
-        y_train,
-        X_val,
-        y_val,
-        n_classes,
-        seed,
-        epochs,
-        native_model=fitted_student.native_model,
-    )
+    try:
+        return _run_static_levels_on_branches(
+            label,
+            fitted_student.branches_per_tree,
+            X_train,
+            y_train,
+            X_val,
+            y_val,
+            n_classes,
+            seed,
+            epochs,
+            native_model=fitted_student.native_model,
+        )
+    finally:
+        del fitted_student
+        if p_soft_train is None:
+            del p_soft
+        _cleanup_memory()
 
 
 def run_l4(
@@ -475,55 +670,168 @@ def run_l4(
     X_val_ts: np.ndarray, mask_val: np.ndarray, y_val: np.ndarray,
     var_names: Sequence[str], n_classes: int, seed: int, epochs: int,
     variants: Sequence[dict],
+    rule_n_estimators: Optional[int] = None,
+    rule_max_leaf_nodes: Optional[int] = None,
+    l4_batch_size: int = 256,
+    progress_csv_path: Optional[str] = None,
+    dataset_name: Optional[str] = None,
+    fold: Optional[int] = None,
 ) -> Dict[str, FoldResult]:
     out: Dict[str, FoldResult] = {}
     t0 = time.time()
     tbn = PPThetaPostTemporal(
         var_names=var_names, n_classes=n_classes,
         seed=seed, epochs=epochs,
+        n_estimators=rule_n_estimators,
+        max_leaf_nodes=rule_max_leaf_nodes,
     ).fit(
         X_train_ts, mask_train, y_train,
         x_val=(X_val_ts, mask_val, y_val),
     )
     fit_secs = time.time() - t0
+    print(
+        f"    [L4] backbone fit done branches={len(tbn.branches)} "
+        f"batch_size={l4_batch_size} fit={fit_secs:.1f}s",
+        flush=True,
+    )
+    _log_mem("after L4 fit")
 
-    z_val = tbn.predict_branch_probs_per_time(X_val_ts, mask_val)
     theta = build_theta_matrix(tbn.branches, n_classes)
 
     # Cache attention weights per ``attention_mode`` so that variants
     # sharing the same mode are not retrained from scratch.
     attention_cache: Dict[str, np.ndarray] = {}
 
-    for variant in variants:
-        if variant["temporal_mode"] == "attention":
-            attn_mode = variant.get("attention_mode", "shared")
-            if attn_mode not in attention_cache:
-                tbn.fit_attention(
-                    X_train_ts, mask_train, y_train, theta=theta,
-                    mode=attn_mode, epochs=200, lr=0.05,
-                )
-                attention_cache[attn_mode] = (
-                    tbn.attention.weights() if tbn.attention is not None else None
-                )
-            attn_w = attention_cache[attn_mode]
-        else:
-            attn_w = None
+    try:
+        variant_states = []
+        for variant in variants:
+            if variant["temporal_mode"] == "attention":
+                attn_mode = variant.get("attention_mode", "shared")
+                if attn_mode not in attention_cache:
+                    print(
+                        f"    [L4] fitting attention mode={attn_mode}",
+                        flush=True,
+                    )
+                    tbn.fit_attention(
+                        X_train_ts, mask_train, y_train, theta=theta,
+                        mode=attn_mode, epochs=200, lr=0.05,
+                    )
+                    attention_cache[attn_mode] = (
+                        tbn.attention.weights() if tbn.attention is not None else None
+                    )
+                attn_w = attention_cache[attn_mode]
+            else:
+                attn_w = None
 
-        clf = TemporalProbLogClassifier(
-            branches=tbn.branches,
-            n_classes=n_classes,
-            head=variant.get("head", "weighted_mean"),
-            temporal_mode=variant["temporal_mode"],
-            k=variant.get("k"),
-            top_k_time=variant.get("top_k_time"),
-            theta=theta,
+            variant_states.append({
+                "variant": variant,
+                "label": f"L4_{variant['name']}",
+                "attention_weights": attn_w,
+                "chunks": [],
+                "agg_seconds": 0.0,
+            })
+
+        n_val = int(X_val_ts.shape[0])
+        batch_size = max(1, int(l4_batch_size))
+        n_batches = int(np.ceil(n_val / batch_size)) if n_val else 0
+        log_every = max(1, min(25, max(1, n_batches // 20)))
+        names = ",".join(str(v["variant"].get("name")) for v in variant_states)
+        print(
+            "    [L4] inference start "
+            f"variants={len(variant_states)} [{names}] "
+            f"val_samples={n_val} batches={n_batches} batch_size={batch_size}",
+            flush=True,
         )
-        t0 = time.time()
-        proba = clf.predict_proba(z_val, attention_weights=attn_w)
-        out[f"L4_{variant['name']}"] = _evaluate(
-            y_val, proba, n_classes, fit_secs, time.time() - t0,
+
+        predict_t0 = time.time()
+        branch_seconds = 0.0
+        iterator = tbn.iter_branch_probs_per_time(
+            X_val_ts, mask_val, batch_size=batch_size,
         )
-    return out
+        for batch_idx in range(1, n_batches + 1):
+            batch_t0 = time.time()
+            try:
+                start_idx, end_idx, z_batch = next(iterator)
+            except StopIteration:
+                break
+            branch_seconds += time.time() - batch_t0
+
+            for state in variant_states:
+                variant = state["variant"]
+                head = variant.get("head", "weighted_mean")
+                t_variant = time.time()
+                z = temporal_aggregate(
+                    z_batch,
+                    mode=variant["temporal_mode"],
+                    k=variant.get("k"),
+                    attention_weights=state["attention_weights"],
+                    top_k_time=variant.get("top_k_time"),
+                )
+                if z.ndim == 1:
+                    z = z[np.newaxis, :]
+                if head == "noisy_or":
+                    proba = aggregate_noisy_or(z, theta)
+                elif head == "weighted_mean":
+                    proba = aggregate_weighted_mean(z, theta)
+                else:
+                    raise ValueError(
+                        "L4 head must be 'noisy_or' or 'weighted_mean', "
+                        f"got {head!r}"
+                    )
+                state["chunks"].append(np.asarray(proba, dtype=np.float32))
+                state["agg_seconds"] += time.time() - t_variant
+                del z, proba
+
+            if (
+                batch_idx == 1
+                or batch_idx == n_batches
+                or batch_idx % log_every == 0
+            ):
+                elapsed = max(time.time() - predict_t0, 1e-9)
+                rate = float(end_idx) / elapsed
+                print(
+                    "    [L4] inference batch "
+                    f"{batch_idx}/{n_batches} rows={end_idx}/{n_val} "
+                    f"elapsed={elapsed:.1f}s rate={rate:.1f} rows/s "
+                    f"branch={branch_seconds:.1f}s",
+                    flush=True,
+                )
+                _log_mem("during L4 inference")
+            del z_batch
+
+        total_wall = time.time() - predict_t0
+        print(
+            f"    [L4] inference one-pass done wall={total_wall:.1f}s "
+            f"shared_branch={branch_seconds:.1f}s",
+            flush=True,
+        )
+
+        for state in variant_states:
+            label = state["label"]
+            chunks = state["chunks"]
+            if chunks:
+                proba = np.vstack(chunks).astype(np.float64, copy=False)
+            else:
+                proba = np.empty((0, n_classes), dtype=np.float64)
+            predict_secs = branch_seconds + float(state["agg_seconds"])
+            out[label] = _evaluate(y_val, proba, n_classes, fit_secs, predict_secs)
+            print(
+                f"    [L4] variant done {label} "
+                f"predict={predict_secs:.1f}s "
+                f"roc_auc={out[label].roc_auc:.4f} pr_auc={out[label].pr_auc:.4f}",
+                flush=True,
+            )
+            if progress_csv_path and dataset_name is not None and fold is not None:
+                _append_fold_rows(
+                    progress_csv_path, dataset_name, int(fold), {label: out[label]}
+                )
+            del proba
+            chunks.clear()
+            _cleanup_memory()
+        return out
+    finally:
+        del attention_cache, theta, tbn
+        _cleanup_memory()
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -689,6 +997,10 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                    help="Number of windows for L2.")
     p.add_argument("--n-intervals", type=int, default=10,
                    help="Number of random intervals for L3.")
+    p.add_argument("--rule-n-estimators", type=int, default=None,
+                   help="Optional ExtraTrees estimator budget for L1-L4 rule learners.")
+    p.add_argument("--rule-max-leaf-nodes", type=int, default=None,
+                   help="Optional max_leaf_nodes budget for L1-L4 rule learners.")
     p.add_argument(
         "--ts-teacher-backend",
         choices=["auto", "tabpfn_ts", "tabpfn", "extratrees"],
@@ -752,9 +1064,30 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--tabpfn-classifier-model-path", default=None,
         help="Path to TabPFN classifier checkpoint for teacher head=tabpfn.",
     )
+    p.add_argument(
+        "--tabpfn-feature-n-estimators", type=int,
+        default=int(os.environ.get("TABPFN_FEATURE_N_ESTIMATORS", "8")),
+        help=(
+            "Number of estimators for ordinary TabPFN temporal-feature "
+            "baselines tabpfn_l1/tabpfn_l2/tabpfn_l3."
+        ),
+    )
+    p.add_argument(
+        "--tabpfn-feature-device", default=os.environ.get("TABPFN_DEVICE"),
+        help=(
+            "Device for ordinary TabPFN temporal-feature baselines. "
+            "Defaults to TABPFN_DEVICE / TabPFN auto."
+        ),
+    )
     p.add_argument("--n-l4-variants", type=int, default=4,
                    help="Number of L4 inference variants to evaluate "
                         "(taken from DEFAULT_TEMPORAL_VARIANTS).")
+    p.add_argument(
+        "--l4-batch-size",
+        type=int,
+        default=int(os.environ.get("TEMPORAL_L4_BATCH_SIZE", "256")),
+        help="Patient batch size for memory-bounded L4 validation inference.",
+    )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--output-dir", default=os.path.join(THIS_DIR, "..",
                                                           "output", "temporal"))
@@ -767,6 +1100,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     os.makedirs(args.output_dir, exist_ok=True)
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     md_path = os.path.join(args.output_dir, f"compare_temporal_{timestamp}.md")
+    fold_csv_path = os.path.join(
+        args.output_dir, f"compare_temporal_{timestamp}_folds.csv",
+    )
+    summary_csv_path = os.path.join(
+        args.output_dir, f"compare_temporal_{timestamp}_summary.csv",
+    )
+    l4_progress_csv_path = os.path.join(
+        args.output_dir, f"compare_temporal_{timestamp}_l4_progress.csv",
+    )
 
     if args.baselines == ["all"]:
         baseline_keys = list(UNIFIED_BASELINE_REGISTRY.keys())
@@ -809,6 +1151,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     md_buf.write(f"Levels: {args.levels} | folds: {args.folds} | "
                  f"epochs: {args.epochs}")
+    if args.rule_n_estimators is not None or args.rule_max_leaf_nodes is not None:
+        md_buf.write(
+            f" | rule_budget: n_estimators={args.rule_n_estimators or 'auto'}"
+            f", max_leaf_nodes={args.rule_max_leaf_nodes or 'auto'}"
+        )
     if args.include_tabpfn_ts_distill:
         md_buf.write(
             f" | tabpfn_ts_distill_levels: {args.tabpfn_ts_distill_levels}"
@@ -816,6 +1163,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f" | ts_teacher_backend: {args.ts_teacher_backend}"
             f" | ts_teacher_head: {args.tabpfn_ts_teacher_head}"
         )
+    if "L4" in level_keys:
+        md_buf.write(f" | l4_batch_size: {args.l4_batch_size}")
     if baseline_keys:
         md_buf.write(f" | baselines: {baseline_keys}")
     md_buf.write("\n")
@@ -843,6 +1192,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     X_va_ts, mask_va, y_va,
                     n_classes=n_classes, seed=args.seed,
                     epochs=args.epochs,
+                    rule_n_estimators=args.rule_n_estimators,
+                    rule_max_leaf_nodes=args.rule_max_leaf_nodes,
                 ))
             if "L2" in level_keys:
                 results.update(run_l2(
@@ -850,6 +1201,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     X_va_ts, mask_va, y_va,
                     n_classes=n_classes, seed=args.seed,
                     epochs=args.epochs, n_windows=args.n_windows,
+                    rule_n_estimators=args.rule_n_estimators,
+                    rule_max_leaf_nodes=args.rule_max_leaf_nodes,
                 ))
             if "L3" in level_keys:
                 results.update(run_l3(
@@ -858,36 +1211,82 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     var_names=var_names, n_classes=n_classes,
                     seed=args.seed, epochs=args.epochs,
                     n_intervals=args.n_intervals,
+                    rule_n_estimators=args.rule_n_estimators,
+                    rule_max_leaf_nodes=args.rule_max_leaf_nodes,
                 ))
             if args.include_tabpfn_ts_distill:
-                for distill_level in args.tabpfn_ts_distill_levels:
-                    for student in args.tabpfn_ts_distill_students:
-                        try:
-                            results.update(run_tabpfn_ts_distill(
-                                X_tr_ts, mask_tr, y_tr,
-                                X_va_ts, mask_va, y_va,
-                                var_names=var_names, n_classes=n_classes,
-                                seed=args.seed, epochs=args.epochs,
-                                level=distill_level,
-                                student=student,
+                p_soft_train = None
+                distill_feature_cache: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+                try:
+                    print("    [TabPFN-TS distill] fitting teacher once per fold", flush=True)
+                    p_soft_train = _fit_tabpfn_ts_soft_labels(
+                        X_tr_ts, mask_tr, y_tr,
+                        n_classes=n_classes,
+                        seed=args.seed,
+                        teacher_backend=args.ts_teacher_backend,
+                        teacher_max_rows=args.ts_teacher_max_rows,
+                        teacher_model_path=args.ts_teacher_model_path,
+                        teacher_device=args.ts_teacher_device,
+                        teacher_n_estimators=args.ts_teacher_n_estimators,
+                        teacher_num_workers=args.ts_teacher_workers,
+                        teacher_head=args.tabpfn_ts_teacher_head,
+                        classifier_model_path=args.tabpfn_classifier_model_path,
+                    )
+                    print(
+                        "    [TabPFN-TS distill] teacher soft labels ready "
+                        f"shape={p_soft_train.shape}",
+                        flush=True,
+                    )
+                except (RuntimeError, ImportError, ValueError) as exc:
+                    print(f"    [skipped] TabPFN-TS distill all students: {exc}")
+                if p_soft_train is not None:
+                    for distill_level in args.tabpfn_ts_distill_levels:
+                        level_key = str(distill_level).upper()
+                        if level_key not in distill_feature_cache:
+                            distill_feature_cache[level_key] = _temporal_student_features(
+                                level_key,
+                                X_tr_ts,
+                                mask_tr,
+                                X_va_ts,
+                                mask_va,
+                                var_names=var_names,
+                                seed=args.seed,
                                 n_windows=args.n_windows,
                                 n_intervals=args.n_intervals,
-                                teacher_backend=args.ts_teacher_backend,
-                                teacher_max_rows=args.ts_teacher_max_rows,
-                                teacher_model_path=args.ts_teacher_model_path,
-                                teacher_device=args.ts_teacher_device,
-                                teacher_n_estimators=args.ts_teacher_n_estimators,
-                                teacher_num_workers=args.ts_teacher_workers,
-                                teacher_head=args.tabpfn_ts_teacher_head,
-                                classifier_model_path=(
-                                    args.tabpfn_classifier_model_path
-                                ),
-                            ))
-                        except (RuntimeError, ImportError, ValueError) as exc:
-                            print(
-                                "    [skipped] TabPFN-TS distill "
-                                f"{distill_level}/{student}: {exc}"
                             )
+                        for student in args.tabpfn_ts_distill_students:
+                            try:
+                                results.update(run_tabpfn_ts_distill(
+                                    X_tr_ts, mask_tr, y_tr,
+                                    X_va_ts, mask_va, y_va,
+                                    var_names=var_names, n_classes=n_classes,
+                                    seed=args.seed, epochs=args.epochs,
+                                    level=level_key,
+                                    student=student,
+                                    n_windows=args.n_windows,
+                                    n_intervals=args.n_intervals,
+                                    teacher_backend=args.ts_teacher_backend,
+                                    teacher_max_rows=args.ts_teacher_max_rows,
+                                    teacher_model_path=args.ts_teacher_model_path,
+                                    teacher_device=args.ts_teacher_device,
+                                    teacher_n_estimators=args.ts_teacher_n_estimators,
+                                    teacher_num_workers=args.ts_teacher_workers,
+                                    teacher_head=args.tabpfn_ts_teacher_head,
+                                    classifier_model_path=(
+                                        args.tabpfn_classifier_model_path
+                                    ),
+                                    p_soft_train=p_soft_train,
+                                    student_features=distill_feature_cache[level_key],
+                                ))
+                            except (RuntimeError, ImportError, ValueError) as exc:
+                                print(
+                                    "    [skipped] TabPFN-TS distill "
+                                    f"{level_key}/{student}: {exc}"
+                                )
+                            finally:
+                                _cleanup_memory()
+                del distill_feature_cache, p_soft_train
+                _cleanup_memory()
             if "L4" in level_keys:
                 results.update(run_l4(
                     X_tr_ts, mask_tr, y_tr,
@@ -895,10 +1294,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     var_names=var_names, n_classes=n_classes,
                     seed=args.seed, epochs=args.epochs,
                     variants=l4_variants,
+                    rule_n_estimators=args.rule_n_estimators,
+                    rule_max_leaf_nodes=args.rule_max_leaf_nodes,
+                    l4_batch_size=args.l4_batch_size,
+                    progress_csv_path=l4_progress_csv_path,
+                    dataset_name=dataset_name,
+                    fold=fold_idx + 1,
                 ))
             for bl_name in baseline_keys:
                 try:
                     baseline_kwargs = {}
+                    if bl_name.startswith("tabpfn_l"):
+                        baseline_kwargs = dict(
+                            n_estimators=args.tabpfn_feature_n_estimators,
+                            auto_scale_n_estimators=False,
+                            device=args.tabpfn_feature_device,
+                            model_path=args.tabpfn_classifier_model_path,
+                            ignore_pretraining_limits=True,
+                        )
                     if bl_name == "tabpfn_ts":
                         baseline_kwargs = dict(
                             ts_backend=args.ts_teacher_backend,
@@ -914,14 +1327,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                             classifier_device=args.ts_teacher_device,
                             classifier_n_estimators=args.ts_teacher_n_estimators,
                         )
-                    results.update(run_baseline(
+                    print(f"    [baseline] {bl_name} start", flush=True)
+                    baseline_results = run_baseline(
                         bl_name,
                         X_tr_ts, mask_tr, y_tr,
                         X_va_ts, mask_va, y_va,
                         n_classes=n_classes, seed=args.seed,
                         epochs=args.epochs,
                         **baseline_kwargs,
-                    ))
+                    )
+                    results.update(baseline_results)
+                    print(
+                        f"    [baseline] {bl_name} done "
+                        f"rows={sorted(baseline_results)}",
+                        flush=True,
+                    )
                 except (RuntimeError, ImportError) as exc:
                     print(f"    [skipped] baseline {bl_name!r}: {exc}")
                 except Exception as exc:                            # pragma: no cover
@@ -929,6 +1349,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
             for variant_name, fold_result in results.items():
                 per_variant.setdefault(variant_name, []).append(fold_result)
+            _append_fold_rows(fold_csv_path, dataset_name, fold_idx + 1, results)
+            del results, X_tr_ts, mask_tr, y_tr, X_va_ts, mask_va, y_va
+            _cleanup_memory()
 
         rows: Dict[str, AggregatedRow] = {}
         for variant_name, fold_list in per_variant.items():
@@ -937,10 +1360,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         table = _format_table(dataset_name, rows)
         md_buf.write(table)
         print(table)
+        _append_summary_rows(summary_csv_path, dataset_name, rows)
 
     with open(md_path, "w", encoding="utf-8") as f:
         f.write(md_buf.getvalue())
     print(f"\nSaved comparison report to {md_path}")
+    print(f"Saved fold CSV to {fold_csv_path}")
+    print(f"Saved summary CSV to {summary_csv_path}")
     return 0
 
 

@@ -933,7 +933,7 @@ class RuleNetworkModel(RuleNetwork):
 
         # θ as trainable parameter (logit-space for unconstrained optim)
         th_logit = torch.nn.Parameter(
-            torch.log(torch.tensor(theta_np, dtype=torch.float32) + 1e-8)
+            torch.log(torch.tensor(theta_np, dtype=torch.float32, device=self.device) + 1e-8)
         )
 
         # Optimise W1 (rule-network params) + theta together.
@@ -1012,6 +1012,8 @@ class RuleNetworkModel(RuleNetwork):
         aux_soft_and: str = "geomean",
         learn_evidence: bool = False,
         evidence_reg_weight: float = 1e-3,
+        p_high: float = 0.95,
+        p_low: float = 0.05,
     ) -> Tuple["RuleNetworkModel", np.ndarray]:
         """Train W1 + θ end-to-end with **differentiable Bayesian posterior**.
 
@@ -1052,8 +1054,8 @@ class RuleNetworkModel(RuleNetwork):
         # Differentiable posterior module
         diff_post = DifferentiablePosterior(
             self.branches,
-            p_high=0.95,
-            p_low=0.05,
+            p_high=float(p_high),
+            p_low=float(p_low),
             tau=tau,
             learn_reliability=learn_evidence,
         ).to(self.device)
@@ -1277,13 +1279,14 @@ class RuleNetworkModel(RuleNetwork):
         diff_post = (
             DifferentiablePosterior(
                 self.branches, p_high=0.95, p_low=0.05, tau=tau
-            )
+            ).to(self.device)
             if use_posterior else None
         )
 
         th_init = np.clip(theta_np.astype(np.float32), 1e-4, 1 - 1e-4)
+        th_init_t = torch.from_numpy(th_init).to(self.device)
         th_logit = torch.nn.Parameter(
-            torch.log(torch.from_numpy(th_init) / (1.0 - torch.from_numpy(th_init)))
+            torch.log(th_init_t / (1.0 - th_init_t))
         )
 
         opt = torch.optim.Adam(

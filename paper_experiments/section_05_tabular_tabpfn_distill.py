@@ -41,11 +41,11 @@ from compare_datasets import main as run_compare_datasets  # noqa: E402
 DEFAULT_ARGS = [
     "--datasets", "sklearn:wine", "sklearn:breast_cancer",
     "--rule-sources", (
-        "extratrees,xgb,catboost,"
+        "extratrees,xgb,catboost,ebm_terms,"
         "tabpfn_distill_xgb,tabpfn_distill_et,tabpfn_distill_cb"
     ),
     "--baselines", "tabpfn",
-    "--variants", "source_native,pl_wmean,pl_full",
+    "--variants", "source_native,pp_theta_post_frozen,pl_wmean,pl_full",
     "--folds", "3",
     "--output-dir", str(ROOT / "output" / "paper" / "05_tabular_tabpfn_distill"),
 ]

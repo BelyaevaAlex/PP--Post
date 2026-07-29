@@ -12,6 +12,7 @@ PyYAML==6.0.1
 scipy==1.13.1
 openml
 beexai==0.0.6
+problog==2.2.10
 
 # --- tabular rule sources and standalone baselines (README §10.8) ---
 # CatBoost: oblivious-tree rule source + TabPFN-distill student option

@@ -40,9 +40,9 @@ from compare_datasets import main as run_compare_datasets  # noqa: E402
 
 DEFAULT_ARGS = [
     "--datasets", "sklearn:wine", "sklearn:breast_cancer",
-    "--rule-sources", "extratrees,catboost",
+    "--rule-sources", "extratrees,catboost,ebm_terms",
     "--baselines", "tabpfn,ebm",
-    "--variants", "source_native,pl_wmean,pl_ens_distill,pl_ens_tabpfn",
+    "--variants", "source_native,pp_theta_post_frozen,pl_wmean,pl_ens_distill,pl_ens_tabpfn",
     "--distill-student", "et",
     "--ensemble-shrinkage", "0.3",
     "--folds", "3",

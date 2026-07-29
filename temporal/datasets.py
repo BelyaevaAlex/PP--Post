@@ -24,6 +24,8 @@ PAMAP2 / MIMIC loaders does not require any other code changes.
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -283,23 +285,89 @@ def load_synthetic_mimic3_mortality(
             "synthetic_mimic3_mortality")
 
 
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Processed real ICU mortality caches
+# ─────────────────────────────────────────────────────────────────────────
+
+PROCESSED_MORTALITY_DIR = (
+    Path(__file__).resolve().parents[1] / "data" / "processed" / "mortality"
+)
+
+
+def _processed_mortality_dir() -> Path:
+    override = os.environ.get("MORTALITY_PROCESSED_DIR")
+    return Path(override).expanduser() if override else PROCESSED_MORTALITY_DIR
+
+
+def load_processed_mortality(name: str, path: Optional[str] = None) -> TemporalDataset:
+    """Load a preprocessed real ICU mortality cache.
+
+    Caches are produced by::
+
+        python -m temporal.mortality_preprocess --datasets mimic3 mimic4 eicu
+
+    The NPZ must contain ``X_ts``, ``mask``, ``y`` and ``var_names``.  Real
+    source databases are never mixed: each key points to one independent cache.
+    """
+    cache_path = Path(path).expanduser() if path is not None else (
+        _processed_mortality_dir() / f"{name}_mortality_48h_temporal.npz"
+    )
+    if not cache_path.exists():
+        raise FileNotFoundError(
+            f"Missing processed mortality cache for {name!r}: {cache_path}. "
+            "Build it with `python -m temporal.mortality_preprocess "
+            f"--datasets {name}`."
+        )
+    arr = np.load(cache_path, allow_pickle=True)
+    required = {"X_ts", "mask", "y", "var_names"}
+    missing = sorted(required - set(arr.files))
+    if missing:
+        raise ValueError(f"{cache_path} is missing arrays: {missing}")
+    X_ts = np.asarray(arr["X_ts"], dtype=np.float32)
+    mask = np.asarray(arr["mask"], dtype=np.uint8)
+    y = np.asarray(arr["y"], dtype=np.int64)
+    var_names = [str(v) for v in arr["var_names"].tolist()]
+    if "dataset_name" in arr.files:
+        dataset_name = str(np.asarray(arr["dataset_name"]).item())
+    else:
+        dataset_name = f"{name}_hospital_mortality_48h"
+    return X_ts, mask, y, var_names, dataset_name
+
+
+def load_mimic3_mortality(**kwargs) -> TemporalDataset:
+    return load_processed_mortality("mimic3", **kwargs)
+
+
+def load_mimic4_mortality(**kwargs) -> TemporalDataset:
+    return load_processed_mortality("mimic4", **kwargs)
+
+
+def load_eicu_mortality(**kwargs) -> TemporalDataset:
+    return load_processed_mortality("eicu", **kwargs)
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # unified loader
 # ─────────────────────────────────────────────────────────────────────────
 
 DATASET_REGISTRY: Dict[str, Callable[..., TemporalDataset]] = {
-    "p12":     load_synthetic_p12,
-    "pam":     load_synthetic_pam,
-    "mimic3":  load_synthetic_mimic3_mortality,
+    "p12":              load_synthetic_p12,
+    "pam":              load_synthetic_pam,
+    "mimic3":           load_synthetic_mimic3_mortality,
+    "mimic3_mortality": load_mimic3_mortality,
+    "mimic4_mortality": load_mimic4_mortality,
+    "eicu_mortality":   load_eicu_mortality,
 }
 
 
 def load_temporal_dataset(name: str, **kwargs) -> TemporalDataset:
     """Load a dataset by short name.
 
-    Currently supported names: ``p12``, ``pam``, ``mimic3``.
-    Real-data loaders (PhysioNet 2012, PAMAP2 UCI, mimic3-benchmarks) will
-    register here once credentialing/IO is wired up.
+    Supported synthetic names: ``p12``, ``pam``, ``mimic3``.
+    Processed real mortality caches: ``mimic3_mortality``,
+    ``mimic4_mortality`` and ``eicu_mortality``.
     """
     key = name.lower()
     if key not in DATASET_REGISTRY:

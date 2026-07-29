@@ -92,6 +92,7 @@ class TabPFNTSFeatureTeacher:
     tabpfn_ts_device: str = "cpu"
     tabpfn_ts_max_context_length: int = 32768
     tabpfn_ts_num_workers: int = 1
+    tabpfn_ts_feature_mode: str = "safe"
     local_estimators: int = 128
     min_transition_rows: int = 8
     verbose: bool = False
@@ -125,7 +126,7 @@ class TabPFNTSFeatureTeacher:
         if self.backend in ("auto", "tabpfn_ts", "tabpfn"):
             try:
                 self.pipeline_ = self._make_tabpfn_ts_pipeline()
-                self.backend_used = "tabpfn_ts"
+                self.backend_used = self._native_backend_label()
                 return self
             except Exception as exc:
                 if self.backend in ("tabpfn_ts", "tabpfn"):
@@ -142,7 +143,13 @@ class TabPFNTSFeatureTeacher:
                     RuntimeWarning,
                 )
 
+        return self._fit_local_backend(X_ts, mask)
+
+    def _fit_local_backend(
+        self, X_ts: np.ndarray, mask: np.ndarray,
+    ) -> "TabPFNTSFeatureTeacher":
         rows, targets, _keys = self._transition_table(X_ts, mask)
+        self.pipeline_ = None
         if rows.shape[0] < self.min_transition_rows:
             self.backend_used = "constant"
             self.regressor_ = None
@@ -174,8 +181,24 @@ class TabPFNTSFeatureTeacher:
                 f"input shape [T={T}, V={V}] does not match fitted "
                 f"[T={self.T_}, V={self.n_variables_}]"
             )
-        if self.backend_used == "tabpfn_ts":
-            return self._transform_native_tabpfn_ts(X_ts, mask)
+        if self.backend_used and self.backend_used.startswith("tabpfn_ts"):
+            try:
+                return self._transform_native_tabpfn_ts(X_ts, mask)
+            except Exception as exc:
+                if self.backend in ("tabpfn_ts", "tabpfn"):
+                    raise RuntimeError(
+                        "Native TabPFN-TS prediction failed. For ICU-style sparse "
+                        "series use TABPFN_TS_FEATURE_MODE=safe (default in this "
+                        "project) or --ts-teacher-backend auto for a fold-level "
+                        "ExtraTrees fallback."
+                    ) from exc
+                warnings.warn(
+                    "TabPFN temporal feature teacher fell back to ExtraTrees "
+                    "during prediction: "
+                    f"{type(exc).__name__}: {exc}",
+                    RuntimeWarning,
+                )
+                self._fit_local_backend(X_ts, mask)
 
         n_feat = len(TEACHER_FEATURES)
         out = np.zeros((N, V, n_feat), dtype=np.float32)
@@ -334,7 +357,7 @@ class TabPFNTSFeatureTeacher:
         from tabpfn_time_series import TabPFNMode, TabPFNTSPipeline
 
         model_path = self._resolve_tabpfn_ts_model_path()
-        pipeline = TabPFNTSPipeline(
+        kwargs = dict(
             max_context_length=self.tabpfn_ts_max_context_length,
             tabpfn_mode=TabPFNMode.LOCAL,
             tabpfn_model_config={
@@ -345,10 +368,53 @@ class TabPFNTSFeatureTeacher:
                 "show_progress_bar": False,
             },
         )
+        temporal_features = self._tabpfn_ts_temporal_features()
+        if temporal_features is not None:
+            kwargs["temporal_features"] = temporal_features
+        pipeline = TabPFNTSPipeline(**kwargs)
         worker = getattr(getattr(pipeline, "predictor", None), "_worker", None)
         if worker is not None and hasattr(worker, "num_workers"):
             worker.num_workers = max(1, int(self.tabpfn_ts_num_workers))
         return pipeline
+
+    def _tabpfn_ts_feature_mode(self) -> str:
+        raw = os.environ.get(
+            "TABPFN_TS_FEATURE_MODE", self.tabpfn_ts_feature_mode,
+        )
+        mode = str(raw).strip().lower().replace("-", "_")
+        aliases = {
+            "default": "default",
+            "safe": "safe",
+            "no_auto": "safe",
+            "no_auto_seasonal": "safe",
+            "auto_no_detrend": "auto_no_detrend",
+        }
+        if mode not in aliases:
+            warnings.warn(
+                f"Unknown TABPFN_TS_FEATURE_MODE={raw!r}; using 'safe'.",
+                RuntimeWarning,
+            )
+            return "safe"
+        return aliases[mode]
+
+    def _native_backend_label(self) -> str:
+        mode = self._tabpfn_ts_feature_mode()
+        return "tabpfn_ts" if mode == "default" else f"tabpfn_ts_{mode}"
+
+    def _tabpfn_ts_temporal_features(self):
+        mode = self._tabpfn_ts_feature_mode()
+        if mode == "default":
+            return None
+        from tabpfn_time_series.features import (
+            AutoSeasonalFeature,
+            CalendarFeature,
+            RunningIndexFeature,
+        )
+
+        features = [RunningIndexFeature(), CalendarFeature()]
+        if mode == "auto_no_detrend":
+            features.append(AutoSeasonalFeature(config={"do_detrend": False}))
+        return features
 
     def _resolve_tabpfn_ts_model_path(self) -> Path:
         raw = (

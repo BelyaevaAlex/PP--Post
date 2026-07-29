@@ -69,12 +69,12 @@ OUTPUT_DIR = ROOT / "output" / "paper" / "07_interpretability_story"
 DEFAULT_ARGS = [
     "--datasets", "sklearn:wine", "sklearn:breast_cancer",
     "--rule-sources", (
-        "extratrees,xgb,catboost,figs,"
+        "extratrees,xgb,catboost,figs,ebm_terms,"
         "tabpfn_distill_xgb,tabpfn_distill_et"
     ),
     "--baselines", "ebm,tabpfn,figs,rulefit",
     "--variants", (
-        "source_native,pl_wmean,pl_full,pp_theta_post_warm,"
+        "source_native,pp_theta_post_frozen,pl_wmean,pl_full,pp_theta_post_warm,"
         "pp_theta_post_aux,pp_theta_post_learn_evidence,"
         "calibrated_e2e_noisy_or,pl_ens_distill,pl_ens_tabpfn"
     ),
@@ -210,16 +210,34 @@ def post_process(csv_path: Path, md_path: Path) -> None:
     print(f"interpretability summary → {md_path}")
 
 
+def _resolved_output_dir(args: list[str]) -> Path:
+    all_args = DEFAULT_ARGS + args
+    out = str(OUTPUT_DIR)
+    i = 0
+    while i < len(all_args):
+        item = all_args[i]
+        if item == "--output-dir" and i + 1 < len(all_args):
+            out = all_args[i + 1]
+            i += 2
+            continue
+        if item.startswith("--output-dir="):
+            out = item.split("=", 1)[1]
+        i += 1
+    return Path(out)
+
+
 def main(argv: list[str] | None = None) -> int:
-    rc = run_compare_datasets(DEFAULT_ARGS + list(argv or sys.argv[1:]))
+    extra_args = list(argv or sys.argv[1:])
+    rc = run_compare_datasets(DEFAULT_ARGS + extra_args)
     if rc != 0:
         return rc
+    out_dir = _resolved_output_dir(extra_args)
     try:
-        csv_path = _latest_csv(OUTPUT_DIR)
+        csv_path = _latest_csv(out_dir)
     except FileNotFoundError as exc:
         print(f"[warn] {exc}; skipping interpretability post-processing")
         return rc
-    post_process(csv_path, OUTPUT_DIR / "interpretability_summary.md")
+    post_process(csv_path, out_dir / "interpretability_summary.md")
     return rc
 
 

@@ -1,0 +1,35 @@
+#!/usr/bin/env python3
+"""Paper Section 14: signed support/opposition aggregation.
+
+Tests a signed log-odds PPtheta head where rules add support for classes above
+the empirical prior and opposition for classes below it.  This is the main
+neuro-symbolic aggregation alternative to weighted mean/noisy-or.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from compare_datasets import main as run_compare_datasets  # noqa: E402
+
+
+DEFAULT_ARGS = [
+    "--rule-sources", "xgb,tabpfn_distill_xgb",
+    "--baselines", "none",
+    "--variants", "pl_wmean,pp_theta_post_frozen,pp_theta_post_signed_logit",
+    "--signed-logit-temperature", "1.0",
+    "--output-dir", str(ROOT / "output" / "paper" / "14_pppost_signed_logit"),
+]
+
+
+def main(argv: list[str] | None = None) -> int:
+    return run_compare_datasets(DEFAULT_ARGS + list(argv or sys.argv[1:]))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

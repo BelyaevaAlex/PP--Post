@@ -206,3 +206,25 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 output/
+
+# Local experiment artifacts
+/data/processed/
+/logs/
+
+# Gated TabPFN checkpoints (download locally, do not commit)
+/data/tabpfn_checkpoints/
+
+# PPtheta-Post project artifacts
+/paper/aaai_pppost_mortality/
+/output/
+/debug_export/
+*.pt
+*.ckpt
+*.pth
+/tmp_problog*.pl
+/compare_all_datasets_results.txt
+/expressivity_report.json
+/scripts/**/__pycache__/
+/temporal/vendor/.venvs/
+
+/formal/lean/.lake/

@@ -16,7 +16,7 @@
 #
 # If the bootstrap fails (e.g. on Apple Silicon without TF metal),
 # compare_temporal.py logs ``[skipped] seft`` and continues.
-tensorflow>=2.10,<2.16
+tensorflow[and-cuda]>=2.15,<2.16
 tensorflow_addons
 keras-transformer
 scikit-learn
